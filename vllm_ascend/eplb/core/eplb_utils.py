@@ -22,8 +22,6 @@ import sys
 import torch
 from vllm.logger import logger
 
-import vllm_ascend.envs as envs_ascend
-
 
 def generate_log2phy_map(expert_map):
     num_local_experts = expert_map.max() + 1
@@ -115,10 +113,9 @@ class EPLBParamUtils:
             return
         if not isinstance(dynamic_eplb, bool):
             raise TypeError("The dynamic_eplb is not bool.")
-
-        if dynamic_eplb and envs_ascend.DYNAMIC_EPLB not in ("true", "1"):
+        if dynamic_eplb and os.getenv("DYNAMIC_EPLB", "false") != "true":
             raise ValueError(
-                'Can not enable dynamic_eplb when DYNAMIC_EPLB is not set to "true" or "1".'
+                'Can not enable dynamic_eplb when not export DYNAMIC_EPLB="true".'
             )
 
     @staticmethod

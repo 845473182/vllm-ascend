@@ -23,7 +23,7 @@ from vllm.logger import logger
 
 from vllm_ascend.eplb.core.eplb_utils import EPLBParamUtils
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
-
+from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 
 class EplbUpdator:
 
@@ -35,7 +35,7 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
 
-    def set_adaptor(self, adaptor):
+    def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
         self.num_moe_layers = self.adaptor.num_moe_layers
         self.global_expert_num = self.adaptor.global_expert_num

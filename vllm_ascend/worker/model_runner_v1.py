@@ -122,7 +122,6 @@ from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                update_mla_attn_dcp_pcp_params,
                                                update_mla_attn_params)
 # yapf: enable
-from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.adaptor.eplb_adptor_factory import EplbAdaptorFactory
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import \
     D2DExpertWeightLoader
@@ -3183,7 +3182,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             self.model = get_model(vllm_config=self.vllm_config)
-            self.eplb_adaptor_cls = EplbAdaptorFactory.get_eplb_adapator(vllm_config=self.vllm_config)
+            self.eplb_adaptor_cls = EplbAdaptorFactory.get_eplb_adapator(
+                vllm_config=self.vllm_config)
             if self.dynamic_eplb:
                 model_register(self.model, self.model_config)
             if get_ascend_device_type() == AscendDeviceType._310P:

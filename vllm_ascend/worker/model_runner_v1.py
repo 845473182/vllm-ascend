@@ -3048,7 +3048,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     batch_descriptor=batch_descriptor,
                     dummy_compute_logits=dummy_drafter_compute_logits)
             if self.in_profile_run and self.dynamic_eplb:
-                self.model.clear_all_moe_loads()
+                self.eplb_adaptor.clear_all_moe_loads()
             if not self.in_profile_run and self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
@@ -3180,10 +3180,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         logger.info("Starting to load model %s...", self.model_config.model)
 
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
-            self.model = get_model(model_config=self.model_config)
+            self.model = get_model(vllm_config=self.vllm_config)
             if self.dynamic_eplb:
                 self.eplb_adaptor_cls = EplbAdaptorFactory.get_eplb_adapator(
-                    vllm_config=self.vllm_config)
+                    model_config=self.model_config)
             if get_ascend_device_type() == AscendDeviceType._310P:
                 from vllm.model_executor.layers.linear import (
                     MergedColumnParallelLinear, QKVParallelLinear,

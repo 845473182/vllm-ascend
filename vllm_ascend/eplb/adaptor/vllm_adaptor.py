@@ -318,10 +318,10 @@ class VllmEplbAdaptor(EplbAdaptor):
         return expert_map_all
 
     def get_expert_map(self, layer_id):
-        return self.model.layers[layer_id].mlp.experts.get_map()
+        return self.model.model.layers[layer_id].mlp.experts.get_map()
 
     def get_log2phy_map(self, layer_id):
-        return self.model.layers[layer_id].mlp.experts.get_log2phy_map()
+        return self.model.model.layers[layer_id].mlp.experts.get_log2phy_map()
 
     def get_all_expert_map(self, num_moe_layers):
         all_loads = []
@@ -338,7 +338,7 @@ class VllmEplbAdaptor(EplbAdaptor):
         num_dense_layers = self.num_dense_layers if hasattr(
             self, "num_dense_layers") else 0
         all_moe_loads = torch.stack(
-            [self.model.layers[layer_id + num_dense_layers].mlp.experts.moe_load \
+            [self.model.model.layers[layer_id + num_dense_layers].mlp.experts.moe_load \
                 for layer_id in range(self.num_moe_layers)],
             dim=0
         )
@@ -348,5 +348,5 @@ class VllmEplbAdaptor(EplbAdaptor):
         num_dense_layers = self.num_dense_layers if hasattr(
             self, "num_dense_layers") else 0
         for layer_id in range(self.num_moe_layers):
-            self.model.layers[layer_id +
+            self.model.model.layers[layer_id +
                               num_dense_layers].mlp.experts.clear_moe_load()

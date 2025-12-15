@@ -20,10 +20,13 @@ import random
 import sys
 
 import torch
+import torch_npu
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 
+
+_MOE_LOAD_ASYNC_STREAM = None
 
 def generate_log2phy_map(expert_map):
     num_local_experts = expert_map.max() + 1
@@ -94,6 +97,14 @@ def determine_default_log2phy_map(global_expert_num, world_size, rank_id):
     log2phy_map_all = generate_log2phy_map(expert_map_all)
 
     return log2phy_map_all[rank_id]
+
+def moe_load_async_stream() -> torch_npu.npu.Stream:
+    global _MOE_LOAD_ASYNC_STREAM
+    if _MOE_LOAD_ASYNC_STREAM is None:
+        # when this function if called before any stream is set,
+        # we return the default stream.
+        _MOE_LOAD_ASYNC_STREAM = torch_npu.npu.Stream()
+    return _MOE_LOAD_ASYNC_STREAM
 
 
 class EPLBParamUtils:

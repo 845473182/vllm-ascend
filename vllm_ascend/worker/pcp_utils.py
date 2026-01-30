@@ -80,6 +80,7 @@ class PCPManager:
                                                    device="cpu",
                                                    dtype=torch.int64)
         self.num_pcp_pads_cpu = self.num_pcp_pads_cpu_tensor.numpy()
+        self.pcp_pads_logits_hybrid_attn[:num_decode_reqs] = self.pcp_world_size - 1
         self.pcp_unpad_mask_cpu_tensor = torch.zeros(
             (max_buffer_num_tokens, ),
             device="cpu",

@@ -154,7 +154,7 @@ def causal_conv1d_fn(
                 final_states_out=conv_states[cache_indices[i]][..., :(
                     width - 1)].unsqueeze(0),
                 initial_states=conv_states[cache_indices[i]][..., :(width - 1)]
-                if has_initial_state[i] else None))
+                ))
 
     if get_pcp_group().world_size > 1:
         conv_states[cache_indices[num_decodes:]] = all_last_width_prefill_x[-1, ...]

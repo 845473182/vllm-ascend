@@ -80,7 +80,6 @@ class PCPManager:
                                                    device="cpu",
                                                    dtype=torch.int64)
         self.num_pcp_pads_cpu = self.num_pcp_pads_cpu_tensor.numpy()
-        self.pcp_pads_logits_hybrid_attn[:num_decode_reqs] = self.pcp_world_size - 1
         self.pcp_unpad_mask_cpu_tensor = torch.zeros(
             (max_buffer_num_tokens, ),
             device="cpu",
@@ -259,7 +258,7 @@ class PCPManager:
         # Record how many pads were added per request (padded - original).
         self.num_pcp_pads_cpu[:num_reqs] = (num_padded_scheduled_tokens -
                                             num_scheduled_tokens)
-
+        self.pcp_pads_logits_hybrid_attn[:num_decode_reqs] = self.pcp_world_size - 1
         # cu_padded_tokens: cumulative sum of padded token counts,
         # pcp_padded_arange: per-request arange flattened for padded tokens.
         cu_padded_tokens, pcp_padded_arange = self._get_cumsum_and_arange(

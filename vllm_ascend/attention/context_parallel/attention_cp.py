@@ -822,7 +822,6 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
             # qkv init
             num_actual_tokens_pcp_padded = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
-            prefill_query = query[num_decode_tokens:num_actual_tokens_pcp_padded].contiguous()
             key = key[self.pcp_size * num_decode_tokens :].contiguous()
             value = value[self.pcp_size * num_decode_tokens :].contiguous()
             if attn_metadata.use_hybrid_attn:

@@ -363,7 +363,7 @@ class PCPManager:
 
                 max_scheduled_prefill_tokens = sum(num_prefill_tokens_allranks[:, 0, 0])
                 num_prefill_tokens = sum(num_scheduled_tokens[num_decode_reqs:])
-                self.total_pcp_padding_tokens_fla = max_scheduled_prefill_tokens & self.pcp_world_size - num_prefill_tokens
+                self.total_pcp_padding_tokens_fla = max_scheduled_prefill_tokens * self.pcp_world_size - num_prefill_tokens
                 self.pcp_padded_tokens_fla += max_scheduled_prefill_tokens - sum(num_prefill_scheduled_tokens_linear)
             
             max_scheduled_tokens = max_scheduled_prefill_tokens + num_decode_tokens
@@ -919,7 +919,7 @@ class PCPManager:
                                                                                                      num_actual_tokens_pcp_padded]
                 else:
                     long_seq_metadata.pcp_allgather_restore_idx = self.pcp_allgather_restore_idx.gpu[:
-                                                                                                     total_num_scheduled_tokens - num_decodes]
+                                                                                                     sum(num_scheduled_tokens) - num_decodes]
 
                 long_seq_metadata.pcp_fa_query_idx = self.pcp_fa_query_idx[: num_actual_tokens_pcp_padded // self.pcp_world_size - num_decodes]
                 long_seq_metadata.pcp_enter_fa_restore_idx = self.pcp_enter_fa_restore_idx[: sum(pcp_unpad_mask) + num_decodes * (self.pcp_world_size - 1)]

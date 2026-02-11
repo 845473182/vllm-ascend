@@ -123,9 +123,9 @@ class PCPManager:
         self.pcp_padded_slot_mapping = torch.zeros(
             self.max_num_tokens + 2 * self.pcp_world_size * self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        self.num_actual_tokens_pcp_padded = 0
         self.pcp_padded_tokens_fla = 0
         self.pcp_padded_tokens_length = 0
+        self.max_num_tokens_across_pcp = 0
 
     def _get_cumsum_and_arange(
         self,
@@ -200,6 +200,7 @@ class PCPManager:
             Tuple (pcp_tokens, pcp_positions):
             - pcp_tokens: number of tokens per request that this PCP rank will
                           actually process (after splitting / replication).
+                          (For Qwen3Next, number of unpadded tokens per request)
             - pcp_positions: flattened positions for those tokens on this rank,
                              used to build the positions buffer for the model.
 
@@ -337,7 +338,7 @@ class PCPManager:
                 )
                 self.pcp_padded_tokens_fla += max_scheduled_prefill_tokens - sum(num_prefill_scheduled_tokens_linear)
 
-            max_scheduled_tokens = max_scheduled_prefill_tokens + self.num_decode_tokens
+            self.max_num_tokens_across_pcp = max_scheduled_prefill_tokens + self.num_decode_tokens
             enter_fa_prefill_restore_idx = None
             if self.num_reqs - self.num_decode_reqs > 0:
                 # prefill reorder idx
@@ -353,7 +354,7 @@ class PCPManager:
                 )
                 # [0,0,0,3,3] [0,M,2M,3M,0,M,2M,3M] -> [0,0,M,M,2M,2M,3M,0,0,M,M,2M,3M] + D
                 prefill_all_offset = (
-                    np.repeat(prefill_rank_offset * max_scheduled_tokens, num_prefill_tokens_allranks.flatten())
+                    np.repeat(prefill_rank_offset * self.max_num_tokens_across_pcp, num_prefill_tokens_allranks.flatten())
                     + self.num_decode_tokens
                 )
 
@@ -377,7 +378,7 @@ class PCPManager:
                 num_decode_pcp_size = np.ones(self.num_decode_reqs, dtype=np.int64) * self.pcp_world_size
                 decode_reqs_offset = np.repeat(np.arange(self.num_decode_reqs, dtype=np.int64), num_decode_pcp_size)
                 decode_ranks_offset = (
-                    self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)[1] * max_scheduled_tokens
+                    self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)[1] * self.max_num_tokens_across_pcp
                 )
                 enter_fa_decode_restore_idx = np.add(decode_reqs_offset, decode_ranks_offset)
 
@@ -431,7 +432,7 @@ class PCPManager:
             else:
                 self.total_num_sampled_tokens_pcp = pcp_tokens[: self.num_reqs].sum()
 
-            return num_padded_scheduled_tokens, pcp_tokens[: self.num_reqs], max_scheduled_tokens, positions_linear
+            return num_padded_scheduled_tokens, positions_linear
         else:
             # Build the restore index used after allgather.
             all_positions_lst = [
@@ -443,7 +444,7 @@ class PCPManager:
 
             self.pcp_tokens[: self.num_reqs] = pcp_tokens[: self.num_reqs]
             self.total_num_sampled_tokens_pcp = pcp_tokens[: self.num_reqs].sum()
-            return pcp_tokens[: self.num_reqs], None, sum(pcp_tokens), positions
+            return pcp_tokens[: self.num_reqs], positions
 
     def get_logits_indices(self, cu_num_tokens: np.ndarray):
         return torch.from_numpy(cu_num_tokens) * self.pcp_world_size - self.num_pcp_pads_cpu_tensor[: self.num_reqs] - 1

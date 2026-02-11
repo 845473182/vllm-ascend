@@ -373,6 +373,7 @@ class NPUModelRunner(GPUModelRunner):
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
+        self.num_scheduled_tokens_padded = None
 
     @property
     def use_cp(self) -> bool:
@@ -598,17 +599,16 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_spec_tokens,
             )
 
-        max_num_tokens_across_pcp = 0
-        num_scheduled_tokens_padded = None
         if self.pcp_size > 1:
-            num_scheduled_tokens[:num_reqs], tokens_padded, max_num_tokens_across_pcp, position_pcp = (
+            num_scheduled_tokens[:num_reqs], position_pcp = (
                 self.pcp_manager.update_tokens_for_pcp(
                     num_scheduled_tokens[:num_reqs],
                     self.arange_np,
                 )
             )
+            tokens_padded = self.pcp_manager.pcp_tokens[:num_reqs]
             if self.pcp_manager.pcp_use_hybrid_attn and tokens_padded is not None:
-                num_scheduled_tokens_padded = np.array(tokens_padded, dtype=np.int32)
+                self.num_scheduled_tokens_padded = np.array(tokens_padded, dtype=np.int32)
             # Re-update after PCP split sequences.
             total_num_scheduled_tokens = sum(num_scheduled_tokens[:num_reqs])
             req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
@@ -693,7 +693,7 @@ class NPUModelRunner(GPUModelRunner):
         self.seq_lens.gpu[num_reqs:].fill_(0)
 
         if self.pcp_size > 1 and self.pcp_manager.pcp_use_hybrid_attn:
-            self.query_lens = torch.from_numpy(num_scheduled_tokens_padded)
+            self.query_lens = torch.from_numpy(self.num_scheduled_tokens_padded)
         else:
             self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
@@ -810,13 +810,7 @@ class NPUModelRunner(GPUModelRunner):
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
-        return (
-            logits_indices,
-            spec_decode_metadata,
-            max_num_tokens_across_pcp,
-            num_scheduled_tokens_padded,
-            total_num_scheduled_tokens,
-        )
+        return logits_indices, spec_decode_metadata
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
@@ -1137,8 +1131,6 @@ class NPUModelRunner(GPUModelRunner):
                 (
                     logits_indices,
                     spec_decode_metadata,
-                    max_num_tokens_across_pcp,
-                    num_scheduled_tokens_padded,
                     total_num_scheduled_tokens,
                 ) = self._prepare_inputs(
                     scheduler_output,
@@ -1221,7 +1213,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    num_scheduled_tokens_padded=num_scheduled_tokens_padded,
                 )
 
             (
@@ -1279,7 +1270,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
-                max_tokens_across_pcp=max_num_tokens_across_pcp if self.pcp_size > 1 else 0,
+                max_tokens_across_pcp=self.pcp_manager.max_num_tokens_across_pcp if self.pcp_size > 1 else 0,
                 skip_compiled=has_encoder_input,
             ),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -1859,7 +1850,6 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
-        num_scheduled_tokens_padded: np.ndarray | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1892,7 +1882,7 @@ class NPUModelRunner(GPUModelRunner):
             return self.pcp_manager.generate_pcp_metadata(
                 num_tokens
                 if not (self.pcp_manager.pcp_use_hybrid_attn and self.pcp_size > 1)
-                else sum(num_scheduled_tokens_padded),
+                else sum(self.num_scheduled_tokens_padded),
                 self.query_lens,
                 self.input_batch,
                 num_scheduled_tokens_np,
@@ -1924,7 +1914,7 @@ class NPUModelRunner(GPUModelRunner):
                 if self.pcp_size > 1:
                     total_num_pcp_pads = sum(self.pcp_manager.num_pcp_pads_cpu[:num_reqs])
                     if self.pcp_manager.pcp_use_hybrid_attn:
-                        maybe_pcp_full_tokens = sum(num_scheduled_tokens_padded) * self.pcp_size - total_num_pcp_pads
+                        maybe_pcp_full_tokens = sum(self.num_scheduled_tokens_padded) * self.pcp_size - total_num_pcp_pads
                     else:
                         maybe_pcp_full_tokens = num_tokens * self.pcp_size - total_num_pcp_pads
                 else:
@@ -1941,7 +1931,7 @@ class NPUModelRunner(GPUModelRunner):
                     blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
-                    num_tokens if not self.pcp_manager.pcp_use_hybrid_attn else sum(num_scheduled_tokens_padded),
+                    num_tokens if not self.pcp_manager.pcp_use_hybrid_attn else sum(self.num_scheduled_tokens_padded),
                     num_tokens_padded,
                     slot_mapping,
                 )

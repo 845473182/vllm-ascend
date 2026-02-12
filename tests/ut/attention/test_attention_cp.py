@@ -256,6 +256,7 @@ class TestAscendAttentionCPImpl(TestBase):
         attn_metadata.prefill = MagicMock()
         attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx = torch.tensor(
             [0, 3, 1, 2, 0, 0, 0, 0])
+        attn_metadata.use_hybrid_attn = False
 
         query = torch.rand(num_tokens, num_heads, head_size)
         key = torch.randn(num_tokens, num_heads, head_size)
@@ -271,6 +272,96 @@ class TestAscendAttentionCPImpl(TestBase):
         self.assertEqual(value.shape[0], num_tokens * self.impl.pcp_size)
         self.assertEqual(value.shape[1], num_heads)
         self.assertEqual(value.shape[2], head_size)
+
+    @patch('torch_npu._npu_reshape_and_cache')
+    @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
+    def test_reshape_and_cache_hybrid_attn_unpad(self, mock_npu_reshape_and_cache):
+        num_tokens = 4
+        block_num = 100
+        block_size = 128
+        num_heads = 1
+        head_size = 128
+        self.impl.head_size = head_size
+
+        kv_cache = (torch.randn(block_num, block_size, num_heads, head_size),
+                    torch.randn(block_num, block_size, num_heads, head_size))
+
+        attn_metadata = MagicMock()
+        attn_metadata.num_decode_tokens = 1
+        attn_metadata.num_decodes = 1
+        attn_metadata.num_prefills = 1
+        attn_metadata.slot_mapping = torch.randn(2)
+        attn_metadata.num_actual_tokens_pcp_padded = num_tokens * self.impl.pcp_size
+        attn_metadata.prefill = MagicMock()
+        attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx = torch.tensor(
+            [0, 3, 1, 2, 0, 0, 0, 0])
+        attn_metadata.use_hybrid_attn = True
+
+        query = torch.rand(num_tokens, num_heads, head_size)
+        key = torch.randn(num_tokens, num_heads, head_size)
+        value = torch.randn(num_tokens, num_heads, head_size)
+        output = torch.rand(num_tokens, num_heads * head_size)
+
+        query, key, value, output = self.impl.reshape_and_cache(
+            query, key, value, kv_cache, attn_metadata, output
+        )
+
+        self.assertEqual(query.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(query.shape[1], num_heads)
+        self.assertEqual(query.shape[2], head_size)
+        self.assertEqual(key.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(key.shape[1], num_heads)
+        self.assertEqual(key.shape[2], head_size)
+        self.assertEqual(value.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(value.shape[1], num_heads)
+        self.assertEqual(value.shape[2], head_size)
+        self.assertEqual(output.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(output.shape[1], num_heads * head_size)
+
+    @patch('torch_npu._npu_reshape_and_cache')
+    @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
+    def test_reshape_and_cache_hybrid_attn_pad(self, mock_npu_reshape_and_cache):
+        num_tokens = 4
+        block_num = 100
+        block_size = 128
+        num_heads = 1
+        head_size = 128
+        self.impl.head_size = head_size
+
+        kv_cache = (torch.randn(block_num, block_size, num_heads, head_size),
+                    torch.randn(block_num, block_size, num_heads, head_size))
+
+        attn_metadata = MagicMock()
+        attn_metadata.num_decode_tokens = 1
+        attn_metadata.num_decodes = 1
+        attn_metadata.num_prefills = 1
+        attn_metadata.slot_mapping = torch.randn(2)
+        attn_metadata.num_actual_tokens_pcp_padded = 10
+        attn_metadata.prefill = MagicMock()
+        attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx = torch.tensor(
+            [0, 3, 1, 2, 0, 0, 0, 0])
+        attn_metadata.use_hybrid_attn = True
+
+        query = torch.rand(num_tokens, num_heads, head_size)
+        key = torch.randn(num_tokens, num_heads, head_size)
+        value = torch.randn(num_tokens, num_heads, head_size)
+        output = torch.rand(num_tokens, num_heads * head_size)
+
+        query, key, value, output = self.impl.reshape_and_cache(
+            query, key, value, kv_cache, attn_metadata, output
+        )
+
+        self.assertEqual(query.shape[0], num_tokens * self.impl.pcp_size )
+        self.assertEqual(query.shape[1], num_heads)
+        self.assertEqual(query.shape[2], head_size)
+        self.assertEqual(key.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(key.shape[1], num_heads)
+        self.assertEqual(key.shape[2], head_size)
+        self.assertEqual(value.shape[0], num_tokens * self.impl.pcp_size)
+        self.assertEqual(value.shape[1], num_heads)
+        self.assertEqual(value.shape[2], head_size)
+        self.assertEqual(output.shape[0], num_tokens)
+        self.assertEqual(output.shape[1], num_heads * head_size)
 
 
 class TestUpdateNpuAttnOutLse(TestBase):

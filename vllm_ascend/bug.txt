@@ -1,0 +1,44 @@
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962] WorkerProc hit an exception.
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962] Traceback (most recent call last):
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm/vllm/v1/executor/multiproc_executor.py", line 957, in worker_busy_loop
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     output = func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/worker.py", line 467, in sample_tokens
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return self.model_runner.sample_tokens(grammar_output)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2376, in sample_tokens
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     propose_draft_token_ids(sampler_output.sampled_token_ids)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2322, in propose_draft_token_ids
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     self._draft_token_ids = self.propose_draft_token_ids(
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 1754, in propose_draft_token_ids
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     raise RuntimeError(
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962] RuntimeError: Eagle3 target hidden states have invalid width before combine_hidden_states: got 7168, expected 21504, aux_hidden_shapes=[(4, 7168)], use_mtp_target_hidden_states=False, pcp_size=1.
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962] Traceback (most recent call last):
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm/vllm/v1/executor/multiproc_executor.py", line 957, in worker_busy_loop
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     output = func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/worker.py", line 467, in sample_tokens
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return self.model_runner.sample_tokens(grammar_output)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     return func(*args, **kwargs)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2376, in sample_tokens
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     propose_draft_token_ids(sampler_output.sampled_token_ids)
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2322, in propose_draft_token_ids
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     self._draft_token_ids = self.propose_draft_token_ids(
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]   File "/mnt/share/b30071341/cpp/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 1754, in propose_draft_token_ids
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]     raise RuntimeError(
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962] RuntimeError: Eagle3 target hidden states have invalid width before combine_hidden_states: got 7168, expected 21504, aux_hidden_shapes=[(4, 7168)], use_mtp_target_hidden_states=False, pcp_size=1.
+(Worker_PP1_TP3_EP3 pid=80463) ERROR 06-05 10:59:46 [multiproc_executor.py:962]

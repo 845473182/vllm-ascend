@@ -28,7 +28,9 @@ to transparently pass aux hidden states through IntermediateTensors across PP
 stages. Each PP stage carries forward all aux states from previous stages,
 and the last PP rank merges them into a single list for the drafter.
 
-Currently supports: DeepseekV2Model (used by Kimi K2/K2.6, DeepSeek-V2/V3).
+Currently supports DeepSeekV2-style target models (used by Kimi K2/K2.6,
+DeepSeek-V2/V3). The check is structural so wrapped or locally patched model
+classes can still use the same PP aux propagation path.
 """
 
 import logging
@@ -42,6 +44,21 @@ from vllm.sequence import IntermediateTensors
 logger = logging.getLogger(__name__)
 
 _AUX_KEY_PREFIX = "aux_layer_"
+
+
+def _is_deepseek_v2_like_model(inner_model: nn.Module) -> bool:
+    required_attrs = (
+        "config",
+        "layers",
+        "start_layer",
+        "end_layer",
+        "embed_input_ids",
+        "norm",
+        "make_empty_intermediate_tensors",
+    )
+    return all(hasattr(inner_model, attr) for attr in required_attrs) and hasattr(
+        inner_model.config, "hidden_size"
+    )
 
 
 def _extract_aux_from_intermediate(
@@ -113,6 +130,15 @@ def _make_deepseek_v2_forward():
             return result
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        expected_aux_count = len(getattr(self, "aux_hidden_state_layers", ()))
+        if expected_aux_count and len(aux_hidden_states) != expected_aux_count:
+            raise RuntimeError(
+                "Eagle3 PP aux hidden states are incomplete: "
+                f"got {len(aux_hidden_states)}, expected {expected_aux_count}, "
+                f"aux_layers={getattr(self, 'aux_hidden_state_layers', ())}, "
+                f"start_layer={self.start_layer}, end_layer={self.end_layer}, "
+                f"incoming_aux={len(prev_aux_list)}."
+            )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -150,9 +176,9 @@ def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
 def patch_eagle3_pp_aux_propagation(inner_model: nn.Module) -> bool:
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
 
-    if not isinstance(inner_model, DeepseekV2Model):
+    if not isinstance(inner_model, DeepseekV2Model) and not _is_deepseek_v2_like_model(inner_model):
         logger.warning(
-            "Eagle3 PP aux propagation is only supported for DeepseekV2Model, got %s. Skipping patch.",
+            "Eagle3 PP aux propagation is only supported for DeepSeekV2-like models, got %s. Skipping patch.",
             type(inner_model).__name__,
         )
         return False

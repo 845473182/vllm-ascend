@@ -553,6 +553,9 @@ class NPUModelRunner(GPUModelRunner):
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
+                elif self.speculative_config.method == "dflash":
+                    assert isinstance(self.drafter, AscendDflashProposer)
+                    self.use_aux_hidden_state_outputs = True
                 elif self.speculative_config.method == "extract_hidden_states":
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
@@ -564,7 +567,13 @@ class NPUModelRunner(GPUModelRunner):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
 
     def _eagle3_uses_aux_hidden_state(self) -> bool:
-        if self.speculative_config is None or self.speculative_config.method != "eagle3":
+        if self.speculative_config is None:
+            return False
+
+        if self.speculative_config.method == "dflash":
+            return True
+
+        if self.speculative_config.method != "eagle3":
             return False
 
         draft_model_config = self.speculative_config.draft_model_config
@@ -591,20 +600,63 @@ class NPUModelRunner(GPUModelRunner):
         self.model.set_aux_hidden_state_layers(aux_layers)
 
         if get_pp_group().world_size > 1:
+            wrappers: list[nn.Module] = []
             _inner = self.model
+            if hasattr(_inner, "unwrap"):
+                _inner = _inner.unwrap()
+            wrappers.append(_inner)
+
             if hasattr(_inner, "get_language_model"):
                 _inner = _inner.get_language_model()
+                wrappers.append(_inner)
             elif hasattr(_inner, "language_model"):
-                _inner = _inner.language_model()
+                language_model = _inner.language_model
+                _inner = (
+                    language_model
+                    if isinstance(language_model, nn.Module)
+                    else language_model()
+                )
+                wrappers.append(_inner)
+
             if hasattr(_inner, "model"):
                 _inner = _inner.model
+                wrappers.append(_inner)
+
             from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
                 patch_eagle3_pp_aux_propagation,
             )
 
             if patch_eagle3_pp_aux_propagation(_inner):
-                self.model.make_empty_intermediate_tensors = (
-                    _inner.make_empty_intermediate_tensors
+                make_empty = _inner.make_empty_intermediate_tensors
+                for wrapper in wrappers:
+                    if hasattr(wrapper, "make_empty_intermediate_tensors"):
+                        wrapper.make_empty_intermediate_tensors = make_empty
+                self._eagle3_pp_aux_inner_model = _inner
+                self._ensure_eagle3_aux_intermediate_tensors()
+
+    def _ensure_eagle3_aux_intermediate_tensors(self) -> None:
+        """Ensure FULL graph capture sees stable incoming aux tensor keys."""
+        if self.intermediate_tensors is None:
+            return
+
+        inner_model = getattr(self, "_eagle3_pp_aux_inner_model", None)
+        if inner_model is None:
+            return
+
+        aux_layers = getattr(inner_model, "aux_hidden_state_layers", ())
+        num_incoming_aux_layers = sum(
+            layer_idx < inner_model.start_layer for layer_idx in aux_layers
+        )
+        if num_incoming_aux_layers <= 0:
+            return
+
+        base_tensor = self.intermediate_tensors["hidden_states"]
+        hidden_size = inner_model.config.hidden_size
+        for i in range(num_incoming_aux_layers):
+            key = f"aux_layer_{i}"
+            if key not in self.intermediate_tensors.tensors:
+                self.intermediate_tensors[key] = base_tensor.new_zeros(
+                    (base_tensor.shape[0], hidden_size)
                 )
 
     def _use_aclgraph(self) -> bool:
@@ -1611,6 +1663,7 @@ class NPUModelRunner(GPUModelRunner):
             mtp_hidden_states = getattr(
                 self.get_model(), "get_mtp_target_hidden_states", lambda: None
             )()
+            use_mtp_target_hidden_states = mtp_hidden_states is not None
             if mtp_hidden_states is not None:
                 hidden_states = mtp_hidden_states
 
@@ -1621,15 +1674,20 @@ class NPUModelRunner(GPUModelRunner):
                     token_indices_to_sample = query_start_loc_pcp_full[1 : num_reqs + 1] - 1
                     target_token_ids = input_ids_pcp_full[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
-                    target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
+                    if use_mtp_target_hidden_states:
+                        target_hidden_states = hidden_states[:num_scheduled_tokens]
+                    elif self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                    else:
+                        target_hidden_states = hidden_states
                 else:
                     token_indices_to_sample = None
                     # input_ids can be None for multimodal models.
                     target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
-                    if self.use_aux_hidden_state_outputs:
+                    if use_mtp_target_hidden_states:
+                        target_hidden_states = hidden_states[:num_scheduled_tokens]
+                    elif self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[:num_scheduled_tokens]
@@ -1658,17 +1716,50 @@ class NPUModelRunner(GPUModelRunner):
                 if self.pcp_size > 1:
                     target_token_ids = input_ids_pcp_full[token_indices]
                     target_positions = positions
-                    target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
+                    if use_mtp_target_hidden_states:
+                        target_hidden_states = hidden_states[token_indices]
+                    elif self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                    else:
+                        target_hidden_states = hidden_states
                 else:
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
-                    if self.use_aux_hidden_state_outputs:
+                    if use_mtp_target_hidden_states:
+                        target_hidden_states = hidden_states[token_indices]
+                    elif self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            if (
+                self.speculative_config.method == "eagle3"
+                and self.use_aux_hidden_state_outputs
+            ):
+                target_hidden_size = self.model_config.get_hidden_size()
+                draft_model_config = self.speculative_config.draft_model_config
+                if draft_model_config is not None:
+                    target_hidden_size = getattr(
+                        draft_model_config.hf_config,
+                        "target_hidden_size",
+                        target_hidden_size,
+                    )
+                expected_hidden_size = target_hidden_size * 3
+                if target_hidden_states.shape[-1] != expected_hidden_size:
+                    aux_hidden_shapes = (
+                        [tuple(h.shape) for h in aux_hidden_states]
+                        if aux_hidden_states is not None
+                        else None
+                    )
+                    raise RuntimeError(
+                        "Eagle3 target hidden states have invalid width before "
+                        "combine_hidden_states: "
+                        f"got {target_hidden_states.shape[-1]}, "
+                        f"expected {expected_hidden_size}, "
+                        f"aux_hidden_shapes={aux_hidden_shapes}, "
+                        f"use_mtp_target_hidden_states={use_mtp_target_hidden_states}, "
+                        f"pcp_size={self.pcp_size}."
+                    )
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2687,6 +2778,7 @@ class NPUModelRunner(GPUModelRunner):
                     v[:copy_len], non_blocking=True
                 )
 
+        self._ensure_eagle3_aux_intermediate_tensors()
         return IntermediateTensors(
             {
                 k: v[: (num_tokens + tp - 1) // tp]
@@ -3370,6 +3462,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                         batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
                     )
+                    self._ensure_eagle3_aux_intermediate_tensors()
                 intermediate_tensors = IntermediateTensors(
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                 )

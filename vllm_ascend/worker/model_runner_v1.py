@@ -585,6 +585,47 @@ class NPUModelRunner(GPUModelRunner):
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
 
+    def _eagle3_uses_aux_hidden_state(self) -> bool:
+        if self.speculative_config is None or self.speculative_config.method != "eagle3":
+            return False
+
+        draft_model_config = self.speculative_config.draft_model_config
+        if draft_model_config is None:
+            return True
+
+        eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
+        if eagle_config is None:
+            return True
+        return eagle_config.get("use_aux_hidden_state", True)
+
+    def _configure_eagle3_aux_hidden_states(self) -> None:
+        from vllm.model_executor.models.interfaces import supports_eagle3
+
+        if not supports_eagle3(self.model):
+            raise RuntimeError(
+                "Model does not support EAGLE3 interface but "
+                "aux_hidden_state_outputs was requested"
+            )
+
+        aux_layers = self._get_eagle3_aux_layers_from_config()
+        if not aux_layers:
+            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+        self.model.set_aux_hidden_state_layers(aux_layers)
+
+        if get_pp_group().world_size > 1:
+            _inner = self.model
+            if hasattr(_inner, "get_language_model"):
+                _inner = _inner.get_language_model()
+            elif hasattr(_inner, "language_model"):
+                _inner = _inner.language_model()
+            if hasattr(_inner, "model"):
+                _inner = _inner.model
+            from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
+                patch_eagle3_pp_aux_propagation,
+            )
+
+            patch_eagle3_pp_aux_propagation(_inner)
+
     def _use_aclgraph(self) -> bool:
         return (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -968,6 +1009,9 @@ class NPUModelRunner(GPUModelRunner):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        
+        self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+        self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -1713,6 +1757,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        print(f"scheduler_output.total_num_scheduled_tokens={scheduler_output.total_num_scheduled_tokens}")
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -1770,6 +1815,12 @@ class NPUModelRunner(GPUModelRunner):
             and not self.model_config.is_encoder_decoder
         )):
             scheduler_output = deepcopy(scheduler_output)
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and not pp_group.is_last_rank:
+            new_token_ids = scheduler_output.scheduled_cached_reqs.new_token_ids
+            if new_token_ids and all(not token_ids for token_ids in new_token_ids):
+                scheduler_output = deepcopy(scheduler_output)
+                scheduler_output.scheduled_cached_reqs.new_token_ids = []
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -1834,7 +1885,6 @@ class NPUModelRunner(GPUModelRunner):
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -1921,7 +1971,6 @@ class NPUModelRunner(GPUModelRunner):
                         self.requests,
                         self.compilation_config.static_forward_context,
                         self.model.get_mamba_state_copy_func(),
-                        self._get_mamba_copy_bufs(),
                         preprocess_bufs,
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
@@ -2233,6 +2282,8 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
             if self.speculative_config:
                 input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                     spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
@@ -2282,6 +2333,28 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+            # Get draft token ids if available
+            output_spec_token_ids = None
+            if self._draft_token_ids is not None:
+                # Use synchronous copy to avoid NPU async stream/event
+                # synchronization issues. _get_draft_token_ids_cpu relies on
+                # event.synchronize() which may not properly wait for the
+                # async copy on NPU, resulting in stale data.
+                if torch.is_tensor(self._draft_token_ids):
+                    num_reqs = self._draft_token_ids.shape[0]
+                    draft_ids_list = self._draft_token_ids[:num_reqs].cpu().tolist()
+                    draft_req_ids = self._draft_token_req_ids
+                else:
+                    draft_ids_list = self._draft_token_ids
+                    draft_req_ids = self.input_batch.req_ids
+                if draft_ids_list and draft_req_ids:
+                    draft_by_req_id = dict(
+                        zip(draft_req_ids, draft_ids_list))
+                    output_spec_token_ids = [
+                        draft_by_req_id.get(req_id, [])
+                        for req_id in req_ids_output_copy
+                    ]
+
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
@@ -2306,6 +2379,7 @@ class NPUModelRunner(GPUModelRunner):
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=output_spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             kv_connector_output=kv_connector_output,
@@ -2626,6 +2700,11 @@ class NPUModelRunner(GPUModelRunner):
             assert intermediate_tensors is not None
             for k, v in intermediate_tensors.items():
                 copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+                if k not in self.intermediate_tensors.tensors:
+                    base_tensor = self.intermediate_tensors["hidden_states"]
+                    self.intermediate_tensors[k] = v.new_empty(
+                        (base_tensor.shape[0], *v.shape[1:])
+                    )
                 self.intermediate_tensors[k][:copy_len].copy_(
                     v[:copy_len], non_blocking=True
                 )
@@ -2833,8 +2912,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
-                maybe_num_reqs_padded = num_reqs_padded * self.decode_token_per_req if self.use_cp else num_reqs_padded
-                blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
+                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -2850,7 +2928,7 @@ class NPUModelRunner(GPUModelRunner):
                         # the previous real request can feed stale block-table
                         # and [block, offset] scatter indices to DSA kernels.
                         slot_mapping[:num_tokens_padded].fill_(0)
-                        blk_table_tensor[:maybe_num_reqs_padded].fill_(0)
+                        blk_table_tensor[:num_reqs_padded].fill_(0)
                     else:
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
@@ -3365,6 +3443,7 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    profile_cpp=profile_cpp,
                 )
             if is_profile and self.dynamic_eplb:
                 target = self.model.language_model if hasattr(self.model, "language_model") else self.model
@@ -3452,17 +3531,9 @@ class NPUModelRunner(GPUModelRunner):
                     patch_load_weights(self.vllm_config)
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
-                if self.use_aux_hidden_state_outputs:
-                    from vllm.model_executor.models.interfaces import supports_eagle3
-                    if not supports_eagle3(self.model):
-                        raise RuntimeError(
-                            "Model does not support EAGLE3 interface but "
-                            "aux_hidden_state_outputs was requested"
-                        )
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if not aux_layers:
-                        aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
-                    self.model.set_aux_hidden_state_layers(aux_layers)
+
+            if self._eagle3_uses_aux_hidden_state():
+                self._configure_eagle3_aux_hidden_states()
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
@@ -3523,9 +3594,9 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
-        ):
+        ) and get_pp_group().is_last_rank:
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)

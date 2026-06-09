@@ -1504,6 +1504,27 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        def debug_shape(label: str, tensor: torch.Tensor | None) -> None:
+            from vllm_ascend.utils import device_print
+
+            device_print(label)
+            if tensor is None:
+                device_print("None")
+                return
+            device_print(torch.tensor(list(tensor.shape), dtype=torch.int64, device=tensor.device))
+
+        def debug_aux_states(label: str) -> None:
+            from vllm_ascend.utils import device_print
+
+            device_print(label)
+            if aux_hidden_states is None:
+                device_print("aux_hidden_states=None")
+                return
+            ref_tensor = aux_hidden_states[0] if len(aux_hidden_states) > 0 else hidden_states
+            device_print(torch.tensor([len(aux_hidden_states)], dtype=torch.int64, device=ref_tensor.device))
+            for i, aux in enumerate(aux_hidden_states):
+                debug_shape(f"NPU_PROPOSE aux_{i}_shape", aux)
+
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1642,6 +1663,7 @@ class NPUModelRunner(GPUModelRunner):
             )()
             if mtp_hidden_states is not None:
                 hidden_states = mtp_hidden_states
+                debug_shape("NPU_PROPOSE mtp_hidden_states_override_shape", hidden_states)
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -1652,14 +1674,18 @@ class NPUModelRunner(GPUModelRunner):
                     target_positions = self._get_positions(num_scheduled_tokens)
                     target_hidden_states = hidden_states
                     if self.use_aux_hidden_state_outputs:
+                        debug_aux_states("NPU_PROPOSE no_spec_pcp_aux_count_and_shapes_before_cat")
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                        debug_shape("NPU_PROPOSE no_spec_pcp_target_hidden_after_aux_cat_shape", target_hidden_states)
                 else:
                     token_indices_to_sample = None
                     # input_ids can be None for multimodal models.
                     target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
                     if self.use_aux_hidden_state_outputs:
+                        debug_aux_states("NPU_PROPOSE no_spec_aux_count_and_shapes_before_slice_cat")
                         target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
+                        debug_shape("NPU_PROPOSE no_spec_target_hidden_after_aux_cat_shape", target_hidden_states)
                     else:
                         target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
@@ -1689,15 +1715,25 @@ class NPUModelRunner(GPUModelRunner):
                     target_positions = positions
                     target_hidden_states = hidden_states
                     if self.use_aux_hidden_state_outputs:
+                        debug_aux_states("NPU_PROPOSE spec_pcp_aux_count_and_shapes_before_cat")
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                        debug_shape("NPU_PROPOSE spec_pcp_target_hidden_after_aux_cat_shape", target_hidden_states)
                 else:
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
+                        debug_aux_states("NPU_PROPOSE spec_aux_count_and_shapes_before_index_cat")
+                        debug_shape("NPU_PROPOSE token_indices_shape", token_indices)
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
+                        debug_shape("NPU_PROPOSE spec_target_hidden_after_aux_cat_shape", target_hidden_states)
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            debug_shape("NPU_PROPOSE target_token_ids_shape_before_drafter", target_token_ids)
+            debug_shape("NPU_PROPOSE target_positions_shape_before_drafter", target_positions)
+            debug_shape("NPU_PROPOSE target_hidden_states_shape_before_drafter", target_hidden_states)
+            debug_shape("NPU_PROPOSE next_token_ids_shape_before_drafter", next_token_ids)
+            debug_shape("NPU_PROPOSE token_indices_to_sample_shape_before_drafter", token_indices_to_sample)
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,

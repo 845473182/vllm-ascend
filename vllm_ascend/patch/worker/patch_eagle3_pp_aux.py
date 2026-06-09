@@ -45,6 +45,20 @@ logger = logging.getLogger(__name__)
 
 _AUX_KEY_PREFIX = "aux_layer_"
 
+def _debug_shape(label: str, tensor: torch.Tensor) -> None:
+    from vllm_ascend.utils import device_print
+
+    device_print(label)
+    device_print(torch.tensor(list(tensor.shape), dtype=torch.int64, device=tensor.device))
+
+
+def _debug_count(label: str, count: int, ref: torch.Tensor) -> None:
+    from vllm_ascend.utils import device_print
+
+    device_print(label)
+    device_print(torch.tensor([count], dtype=torch.int64, device=ref.device))
+
+
 def _extract_aux_from_intermediate(
     intermediate_tensors: "IntermediateTensors | None",
 ) -> list[torch.Tensor]:
@@ -67,6 +81,13 @@ def _make_deepseek_v2_forward():
         pp_group = get_pp_group()
 
         prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
+        from vllm_ascend.utils import device_print
+
+        device_print(
+            "EAGLE3_PP_AUX_V2 enter "
+            f"first={pp_group.is_first_rank} last={pp_group.is_last_rank} "
+            f"layers=({self.start_layer},{self.end_layer}) aux_layers={self.aux_hidden_state_layers}"
+        )
 
         if pp_group.is_first_rank:
             if inputs_embeds is not None:
@@ -80,6 +101,12 @@ def _make_deepseek_v2_forward():
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        _debug_shape("EAGLE3_PP_AUX_V2 hidden_after_input_shape", hidden_states)
+        if residual is not None:
+            _debug_shape("EAGLE3_PP_AUX_V2 residual_after_input_shape", residual)
+        _debug_count("EAGLE3_PP_AUX_V2 prev_aux_count", len(prev_aux_list), hidden_states)
+        for i, aux in enumerate(prev_aux_list):
+            _debug_shape(f"EAGLE3_PP_AUX_V2 prev_aux_{i}_shape", aux)
 
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
         llama_4_scaling: torch.Tensor | None = None
@@ -98,7 +125,10 @@ def _make_deepseek_v2_forward():
             start=self.start_layer,
         ):
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+                local_aux = hidden_states + residual if residual is not None else hidden_states
+                device_print(f"EAGLE3_PP_AUX_V2 append_local_aux_layer={idx}")
+                _debug_shape("EAGLE3_PP_AUX_V2 local_aux_shape", local_aux)
+                aux_hidden_states.append(local_aux)
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         if not pp_group.is_last_rank:
@@ -110,10 +140,16 @@ def _make_deepseek_v2_forward():
             )
             for i, t in enumerate(aux_hidden_states):
                 result.tensors[f"{_AUX_KEY_PREFIX}{i}"] = t
+                _debug_shape(f"EAGLE3_PP_AUX_V2 return_aux_{i}_shape", t)
+            _debug_count("EAGLE3_PP_AUX_V2 return_aux_count", len(aux_hidden_states), hidden_states)
             return result
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        _debug_shape("EAGLE3_PP_AUX_V2 final_hidden_shape", hidden_states)
         if len(aux_hidden_states) > 0:
+            for i, aux in enumerate(aux_hidden_states):
+                _debug_shape(f"EAGLE3_PP_AUX_V2 final_aux_{i}_shape", aux)
+            _debug_count("EAGLE3_PP_AUX_V2 final_aux_count", len(aux_hidden_states), hidden_states)
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -131,6 +167,13 @@ def _make_deepseek_v4_forward():
         pp_group = get_pp_group()
 
         prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
+        from vllm_ascend.utils import device_print
+
+        device_print(
+            "EAGLE3_PP_AUX_V4 enter "
+            f"first={pp_group.is_first_rank} last={pp_group.is_last_rank} "
+            f"layers=({self.start_layer},{self.end_layer}) aux_layers={self.aux_hidden_state_layers}"
+        )
 
         if pp_group.is_first_rank:
             if inputs_embeds is not None:
@@ -145,6 +188,10 @@ def _make_deepseek_v4_forward():
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = None
+        _debug_shape("EAGLE3_PP_AUX_V4 hidden_after_input_shape", hidden_states)
+        _debug_count("EAGLE3_PP_AUX_V4 prev_aux_count", len(prev_aux_list), hidden_states)
+        for i, aux in enumerate(prev_aux_list):
+            _debug_shape(f"EAGLE3_PP_AUX_V4 prev_aux_{i}_shape", aux)
 
         llama_4_scaling = None
 
@@ -154,14 +201,16 @@ def _make_deepseek_v4_forward():
             start=self.start_layer,
         ):
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    self.hc_head(
-                        hidden_states,
-                        self.hc_head_fn,
-                        self.hc_head_scale,
-                        self.hc_head_base,
-                    )
+                device_print(f"EAGLE3_PP_AUX_V4 append_local_aux_layer={idx}")
+                _debug_shape("EAGLE3_PP_AUX_V4 hidden_before_local_hc_head_shape", hidden_states)
+                local_aux = self.hc_head(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
                 )
+                _debug_shape("EAGLE3_PP_AUX_V4 local_aux_after_hc_head_shape", local_aux)
+                aux_hidden_states.append(local_aux)
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Keep DeepseekV4 MTP's pre-hc_head target hidden-state buffer in sync
@@ -186,8 +235,11 @@ def _make_deepseek_v4_forward():
             result = IntermediateTensors({"hidden_states": hidden_states})
             for i, t in enumerate(aux_hidden_states):
                 result.tensors[f"{_AUX_KEY_PREFIX}{i}"] = t
+                _debug_shape(f"EAGLE3_PP_AUX_V4 return_aux_{i}_shape", t)
+            _debug_count("EAGLE3_PP_AUX_V4 return_aux_count", len(aux_hidden_states), hidden_states)
             return result
 
+        _debug_shape("EAGLE3_PP_AUX_V4 hidden_before_final_hc_head_shape", hidden_states)
         hidden_states = self.hc_head(
             hidden_states,
             self.hc_head_fn,
@@ -195,7 +247,11 @@ def _make_deepseek_v4_forward():
             self.hc_head_base,
         )
         hidden_states = self.norm(hidden_states)
+        _debug_shape("EAGLE3_PP_AUX_V4 final_hidden_shape", hidden_states)
         if len(aux_hidden_states) > 0:
+            for i, aux in enumerate(aux_hidden_states):
+                _debug_shape(f"EAGLE3_PP_AUX_V4 final_aux_{i}_shape", aux)
+            _debug_count("EAGLE3_PP_AUX_V4 final_aux_count", len(aux_hidden_states), hidden_states)
             return hidden_states, aux_hidden_states
         return hidden_states
 

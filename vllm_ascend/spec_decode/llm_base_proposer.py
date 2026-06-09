@@ -615,7 +615,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert isinstance(
                 self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
+            from vllm_ascend.utils import device_print
+
+            device_print("LLM_BASE_PROPOSER before_combine_target_hidden_states_shape")
+            device_print(
+                torch.tensor(
+                    list(target_hidden_states.shape),
+                    dtype=torch.int64,
+                    device=target_hidden_states.device,
+                )
+            )
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+            device_print("LLM_BASE_PROPOSER after_combine_target_hidden_states_shape")
+            device_print(
+                torch.tensor(
+                    list(target_hidden_states.shape),
+                    dtype=torch.int64,
+                    device=target_hidden_states.device,
+                )
+            )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(

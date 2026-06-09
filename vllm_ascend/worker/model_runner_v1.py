@@ -613,19 +613,33 @@ class NPUModelRunner(GPUModelRunner):
         self.model.set_aux_hidden_state_layers(aux_layers)
 
         if get_pp_group().world_size > 1:
-            _inner = self.model
-            if hasattr(_inner, "get_language_model"):
-                _inner = _inner.get_language_model()
-            elif hasattr(_inner, "language_model"):
-                language_model = _inner.language_model
-                _inner = language_model() if callable(language_model) else language_model
-            if hasattr(_inner, "model"):
-                _inner = _inner.model
+            outer_model = self.model
+            language_model = outer_model
+            if hasattr(language_model, "get_language_model"):
+                language_model = language_model.get_language_model()
+            elif hasattr(language_model, "language_model"):
+                language_model_attr = language_model.language_model
+                language_model = language_model_attr() if callable(language_model_attr) else language_model_attr
+            inner_model = language_model.model if hasattr(language_model, "model") else language_model
             from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
                 patch_eagle3_pp_aux_propagation,
             )
 
-            patch_eagle3_pp_aux_propagation(_inner)
+            if patch_eagle3_pp_aux_propagation(inner_model):
+                # Some wrappers cache this callable during __init__. Refresh all
+                # wrapper levels so PP receive buffers include aux hidden states.
+                make_empty_intermediate_tensors = inner_model.make_empty_intermediate_tensors
+                if hasattr(language_model, "make_empty_intermediate_tensors"):
+                    language_model.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+                if hasattr(outer_model, "make_empty_intermediate_tensors"):
+                    outer_model.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+                logger.info(
+                    "Refreshed Eagle3 PP aux make_empty_intermediate_tensors "
+                    "for outer=%s, language_model=%s, inner=%s.",
+                    type(outer_model).__name__,
+                    type(language_model).__name__,
+                    type(inner_model).__name__,
+                )
 
     def _use_aclgraph(self) -> bool:
         return (

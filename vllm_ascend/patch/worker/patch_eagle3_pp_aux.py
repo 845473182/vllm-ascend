@@ -44,6 +44,7 @@ from vllm.sequence import IntermediateTensors
 logger = logging.getLogger(__name__)
 
 _AUX_KEY_PREFIX = "aux_layer_"
+_CLASS_PATCH_FLAG = "_vllm_ascend_eagle3_pp_aux_class_patched"
 
 def _debug_shape(label: str, tensor: torch.Tensor) -> None:
     from vllm_ascend.utils import device_print
@@ -275,6 +276,27 @@ def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
         return result
 
     inner_model.make_empty_intermediate_tensors = pp_make_empty_intermediate_tensors
+
+
+def patch_eagle3_pp_aux_class_forward() -> None:
+    """Patch class forward before support_torch_compile captures it."""
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
+
+    if not getattr(DeepseekV2Model, _CLASS_PATCH_FLAG, False):
+        DeepseekV2Model.forward = _make_deepseek_v2_forward()
+        setattr(DeepseekV2Model, _CLASS_PATCH_FLAG, True)
+        logger.info("Patched DeepseekV2Model class forward for Eagle3 PP aux propagation.")
+
+    try:
+        from vllm_ascend.models.deepseek_v4 import DeepseekV4Model
+    except ImportError:
+        DeepseekV4Model = None  # type: ignore[assignment]
+
+    if DeepseekV4Model is not None and not getattr(DeepseekV4Model, _CLASS_PATCH_FLAG, False):
+        DeepseekV4Model.forward = _make_deepseek_v4_forward()
+        setattr(DeepseekV4Model, _CLASS_PATCH_FLAG, True)
+        logger.info("Patched DeepseekV4Model class forward for Eagle3 PP aux propagation.")
+
 
 def patch_eagle3_pp_aux_propagation(inner_model: nn.Module) -> bool:
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model

@@ -3566,6 +3566,12 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
+            if self._eagle3_uses_aux_hidden_state() and get_pp_group().world_size > 1:
+                from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (
+                    patch_eagle3_pp_aux_class_forward,
+                )
+
+                patch_eagle3_pp_aux_class_forward()
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention

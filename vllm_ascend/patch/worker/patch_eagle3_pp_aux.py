@@ -280,6 +280,10 @@ def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
 
 def patch_eagle3_pp_aux_class_forward() -> None:
     """Patch class forward before support_torch_compile captures it."""
+    from vllm_ascend.utils import _ensure_device_print_registered
+
+    _ensure_device_print_registered()
+
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
 
     if not getattr(DeepseekV2Model, _CLASS_PATCH_FLAG, False):

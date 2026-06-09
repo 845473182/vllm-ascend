@@ -617,7 +617,8 @@ class NPUModelRunner(GPUModelRunner):
             if hasattr(_inner, "get_language_model"):
                 _inner = _inner.get_language_model()
             elif hasattr(_inner, "language_model"):
-                _inner = _inner.language_model()
+                language_model = _inner.language_model
+                _inner = language_model() if callable(language_model) else language_model
             if hasattr(_inner, "model"):
                 _inner = _inner.model
             from vllm_ascend.patch.worker.patch_eagle3_pp_aux import (

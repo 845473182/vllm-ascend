@@ -64,6 +64,52 @@ class _FakeDeepseekV2Model(nn.Module):
         )
 
 
+class _FakeV4Layer(nn.Module):
+    def __init__(self, delta: float):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, positions, hidden_states, residual, llama_4_scaling):
+        del positions, residual, llama_4_scaling
+        return hidden_states + self.delta, None
+
+
+class _FakeDeepseekV4Model(nn.Module):
+    def __init__(self, start_layer: int, end_layer: int, aux_hidden_state_layers: tuple[int, ...]):
+        super().__init__()
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.aux_hidden_state_layers = aux_hidden_state_layers
+        self.config = SimpleNamespace(hidden_size=2)
+        self.hc_mult = 3
+        self.hc_head_fn = torch.empty(0)
+        self.hc_head_scale = torch.empty(0)
+        self.hc_head_base = torch.empty(0)
+        self._mtp_hidden_buffer = torch.empty(16, self.hc_mult * self.config.hidden_size)
+        self.layers = nn.ModuleList([_FakeV4Layer(float(i + 1)) for i in range(4)])
+
+    def embed_input_ids(self, input_ids):
+        return input_ids.to(torch.float32).unsqueeze(-1).expand(-1, self.config.hidden_size)
+
+    def hc_head(self, hidden_states, hc_head_fn, hc_head_scale, hc_head_base):
+        del hc_head_fn, hc_head_scale, hc_head_base
+        return hidden_states.sum(dim=1)
+
+    def norm(self, hidden_states):
+        return hidden_states + 100.0
+
+    def make_empty_intermediate_tensors(self, batch_size, dtype, device):
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.hc_mult, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+            }
+        )
+
+
 def test_extract_aux_from_intermediate_sorts_by_aux_index():
     aux_2 = torch.full((1, 2), 2.0)
     aux_10 = torch.full((1, 2), 10.0)
@@ -141,6 +187,36 @@ def test_last_pp_rank_returns_complete_aux_states(monkeypatch):
     torch.testing.assert_close(aux_states[0], previous_aux)
     torch.testing.assert_close(aux_states[1], hidden_states + residual)
     torch.testing.assert_close(output_hidden_states, hidden_states + 4.0 + residual + 4.0)
+
+
+def test_deepseek_v4_last_pp_rank_returns_previous_and_projected_local_aux(monkeypatch):
+    monkeypatch.setattr(
+        eagle3_pp_aux,
+        "get_pp_group",
+        lambda: _FakePPGroup(is_first_rank=False, is_last_rank=True),
+    )
+    forward = eagle3_pp_aux._make_deepseek_v4_forward()
+    model = _FakeDeepseekV4Model(start_layer=3, end_layer=4, aux_hidden_state_layers=(1, 3))
+    previous_aux = torch.full((2, 2), 13.0)
+    hidden_states = torch.full((2, 3, 2), 2.0)
+    intermediate = IntermediateTensors(
+        {
+            "hidden_states": hidden_states,
+            "aux_layer_0": previous_aux,
+        }
+    )
+
+    output_hidden_states, aux_states = forward(
+        model,
+        None,
+        torch.arange(2),
+        intermediate_tensors=intermediate,
+    )
+
+    assert len(aux_states) == 2
+    torch.testing.assert_close(aux_states[0], previous_aux)
+    torch.testing.assert_close(aux_states[1], hidden_states.sum(dim=1))
+    torch.testing.assert_close(output_hidden_states, (hidden_states + 4.0).sum(dim=1) + 100.0)
 
 
 def test_make_empty_intermediate_tensors_allocates_only_incoming_aux_layers():

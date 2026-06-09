@@ -28,7 +28,9 @@ to transparently pass aux hidden states through IntermediateTensors across PP
 stages. Each PP stage carries forward all aux states from previous stages,
 and the last PP rank merges them into a single list for the drafter.
 
-Currently supports: DeepseekV2Model (used by Kimi K2/K2.6, DeepSeek-V2/V3).
+Currently supports:
+- DeepseekV2Model (used by DeepSeek-V2/V3 style target models).
+- DeepseekV4Model (used by Kimi K2.6 / DeepSeek-V4 style target models).
 """
 
 import logging
@@ -117,6 +119,89 @@ def _make_deepseek_v2_forward():
 
     return pp_eagle3_forward
 
+
+def _make_deepseek_v4_forward():
+    def pp_eagle3_forward(
+        self,
+        input_ids: "torch.Tensor | None",
+        positions: torch.Tensor,
+        intermediate_tensors: "IntermediateTensors | None" = None,
+        inputs_embeds: "torch.Tensor | None" = None,
+    ):
+        pp_group = get_pp_group()
+
+        prev_aux_list = _extract_aux_from_intermediate(intermediate_tensors)
+
+        if pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                if input_ids is None:
+                    raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV4Model.forward")
+                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = None
+
+        llama_4_scaling = None
+
+        aux_hidden_states: list[torch.Tensor] = list(prev_aux_list)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    self.hc_head(
+                        hidden_states,
+                        self.hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                    )
+                )
+            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+
+        # Keep DeepseekV4 MTP's pre-hc_head target hidden-state buffer in sync
+        # with the original model forward.
+        from vllm_ascend.ascend_forward_context import get_forward_context
+
+        forward_ctx = get_forward_context()
+        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
+            pad_size = forward_ctx.pad_size
+            if pad_size > 0:
+                h_states_flat = h_states_flat[:-pad_size]
+            num_tokens = h_states_flat.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+        else:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+
+        if not pp_group.is_last_rank:
+            result = IntermediateTensors({"hidden_states": hidden_states})
+            for i, t in enumerate(aux_hidden_states):
+                result.tensors[f"{_AUX_KEY_PREFIX}{i}"] = t
+            return result
+
+        hidden_states = self.hc_head(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+        )
+        hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    return pp_eagle3_forward
+
+
 def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
     original_make_empty = inner_model.make_empty_intermediate_tensors
 
@@ -124,7 +209,8 @@ def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
         result = original_make_empty(batch_size, dtype, device)
         aux_layers = getattr(inner_model, "aux_hidden_state_layers", ())
         hidden_size = inner_model.config.hidden_size
-        for i in range(len(aux_layers)):
+        num_incoming_aux_layers = sum(1 for layer_idx in aux_layers if layer_idx < inner_model.start_layer)
+        for i in range(num_incoming_aux_layers):
             result.tensors[f"{_AUX_KEY_PREFIX}{i}"] = torch.zeros(
                 (batch_size, hidden_size),
                 dtype=dtype,
@@ -137,14 +223,26 @@ def _patch_make_empty_intermediate_tensors(inner_model: nn.Module) -> None:
 def patch_eagle3_pp_aux_propagation(inner_model: nn.Module) -> bool:
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
 
-    if not isinstance(inner_model, DeepseekV2Model):
+    forward = None
+    if isinstance(inner_model, DeepseekV2Model):
+        forward = _make_deepseek_v2_forward()
+    else:
+        try:
+            from vllm_ascend.models.deepseek_v4 import DeepseekV4Model
+        except ImportError:
+            DeepseekV4Model = None  # type: ignore[assignment]
+        if DeepseekV4Model is not None and isinstance(inner_model, DeepseekV4Model):
+            forward = _make_deepseek_v4_forward()
+
+    if forward is None:
         logger.warning(
-            "Eagle3 PP aux propagation is only supported for DeepseekV2Model, got %s. Skipping patch.",
+            "Eagle3 PP aux propagation is only supported for DeepseekV2Model and DeepseekV4Model, "
+            "got %s. Skipping patch.",
             type(inner_model).__name__,
         )
         return False
 
-    inner_model.forward = _make_deepseek_v2_forward().__get__(inner_model, type(inner_model))
+    inner_model.forward = forward.__get__(inner_model, type(inner_model))
     _patch_make_empty_intermediate_tensors(inner_model)
 
     logger.info(

@@ -249,8 +249,8 @@ class ProfilingChunkScheduler(Scheduler):
         # feature is temporarily disabled. It will be enabled again after the
         # issues with the FIA operator are resolved. Therefore, in multi-request
         # concurrent scenarios, there is still room for performance improvement in CPP.
-        # time_budget = self.profiling_chunk_manager.predictor.target_latency
-        time_budget = 0.01
+        time_budget = self.profiling_chunk_manager.predictor.target_latency
+        # time_budget = 0.01
         # <<< PROFILING CHUNK <<<
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -320,7 +320,7 @@ class ProfilingChunkScheduler(Scheduler):
             if (
                 self.profiling_chunk_manager is not None
                 and self.profiling_chunk_manager.is_ready
-                and num_new_tokens > 1
+                and request.num_computed_tokens < request.num_prompt_tokens
                 and request.num_computed_tokens > 0
             ):
                 predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
@@ -388,7 +388,7 @@ class ProfilingChunkScheduler(Scheduler):
             token_budget -= num_new_tokens
             # Decode requests (num_new_tokens == 1) have negligible latency;
             # skip time_budget accounting so they don't starve other requests.
-            if num_new_tokens > 1:
+            if request.num_computed_tokens < request.num_prompt_tokens:
                 time_budget -= self.profiling_chunk_manager.predict_time(num_new_tokens, request.num_computed_tokens)
             req_index += 1
 
@@ -533,7 +533,7 @@ class ProfilingChunkScheduler(Scheduler):
                     if (
                         self.profiling_chunk_manager is not None
                         and self.profiling_chunk_manager.is_ready
-                        and num_new_tokens > 1
+                        and request.num_computed_tokens < request.num_prompt_tokens
                         and request.num_computed_tokens > 0
                     ):
                         predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
@@ -666,7 +666,7 @@ class ProfilingChunkScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 # Decode requests (num_new_tokens == 1) have negligible latency;
                 # skip time_budget accounting so they don't starve other requests.
-                if num_new_tokens > 1:
+                if request.num_computed_tokens < request.num_prompt_tokens:
                     time_budget -= self.profiling_chunk_manager.predict_time(
                         num_new_tokens, request.num_computed_tokens
                     )

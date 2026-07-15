@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -257,6 +258,58 @@ class AscendConfig:
         from vllm_ascend.utils import model_uses_sfa_sparse
 
         use_sparse = model_uses_sfa_sparse(vllm_config.model_config)
+
+        enable_ffn_chunking = additional_config.get("enable_ffn_chunking", False)
+        if not isinstance(enable_ffn_chunking, bool):
+            raise ValueError(
+                "enable_ffn_chunking must be a boolean, got "
+                f"{type(enable_ffn_chunking).__name__}: {enable_ffn_chunking}"
+            )
+
+        live_factor = additional_config.get("ffn_chunk_live_factor", 3.0)
+        target_hidden_factor = additional_config.get("ffn_chunk_target_hidden_factor", 2.0)
+        if isinstance(live_factor, bool) or not isinstance(live_factor, (int, float)):
+            raise ValueError(
+                "ffn_chunk_live_factor must be a number, got " f"{type(live_factor).__name__}: {live_factor}"
+            )
+        if isinstance(target_hidden_factor, bool) or not isinstance(target_hidden_factor, (int, float)):
+            raise ValueError(
+                "ffn_chunk_target_hidden_factor must be a number, got "
+                f"{type(target_hidden_factor).__name__}: {target_hidden_factor}"
+            )
+        self.ffn_chunk_live_factor = float(live_factor)
+        self.ffn_chunk_target_hidden_factor = float(target_hidden_factor)
+
+        ffn_min_chunk_size = additional_config.get("ffn_min_chunk_size", 1024)
+        if isinstance(ffn_min_chunk_size, bool) or not isinstance(ffn_min_chunk_size, int):
+            raise ValueError(
+                "ffn_min_chunk_size must be an integer, got "
+                f"{type(ffn_min_chunk_size).__name__}: {ffn_min_chunk_size}"
+            )
+        self.ffn_min_chunk_size = ffn_min_chunk_size
+
+        if not math.isfinite(self.ffn_chunk_live_factor) or self.ffn_chunk_live_factor <= 0:
+            raise ValueError(
+                "ffn_chunk_live_factor must be finite and positive, got " f"{self.ffn_chunk_live_factor}"
+            )
+        if (
+            not math.isfinite(self.ffn_chunk_target_hidden_factor)
+            or self.ffn_chunk_target_hidden_factor <= 0
+        ):
+            raise ValueError(
+                "ffn_chunk_target_hidden_factor must be finite and positive, got "
+                f"{self.ffn_chunk_target_hidden_factor}"
+            )
+        if self.ffn_min_chunk_size <= 0:
+            raise ValueError(f"ffn_min_chunk_size must be positive, got {self.ffn_min_chunk_size}")
+
+        self.enable_ffn_chunking = enable_ffn_chunking and use_sparse
+        if enable_ffn_chunking and not use_sparse:
+            logger.warning_once(
+                "enable_ffn_chunking is ignored because the model does not use SFA sparse Attention."
+            )
+        if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
 
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
         if self.enable_kv_nz:

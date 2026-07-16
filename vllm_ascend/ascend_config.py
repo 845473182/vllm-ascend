@@ -310,6 +310,14 @@ class AscendConfig:
             )
         if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
             raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
+        if self.enable_ffn_chunking:
+            logger.info_once(
+                "[fused_moe] MoE FFN token chunking is enabled for routed experts: "
+                "live_factor=%s, target_hidden_factor=%s, min_chunk_size=%s.",
+                self.ffn_chunk_live_factor,
+                self.ffn_chunk_target_hidden_factor,
+                self.ffn_min_chunk_size,
+            )
 
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
         if self.enable_kv_nz:

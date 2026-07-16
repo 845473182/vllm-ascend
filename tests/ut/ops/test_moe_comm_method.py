@@ -83,15 +83,19 @@ class TestMoECommMethod(TestBase):
             return value.hidden_states + 1, None
 
         comm_impl._apply_mlp = fake_apply_mlp
-        output, _ = comm_impl._apply_mlp_with_optional_chunking(mlp_input)
+        with patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.info_once") as mock_info_once:
+            output, _ = comm_impl._apply_mlp_with_optional_chunking(mlp_input)
+            comm_impl._apply_mlp_with_optional_chunking(mlp_input)
 
         torch.testing.assert_close(output, hidden_states + 1)
+        mock_info_once.assert_called_once()
+        assert "MoE FFN token chunking is active" in mock_info_once.call_args.args[0]
         assert [value.tolist() for value in seen_group_lists] == [
             [3, 0, 0],
             [0, 2, 0],
             [0, 0, 2],
             [0, 0, 2],
-        ]
+        ] * 2
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")

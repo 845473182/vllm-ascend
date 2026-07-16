@@ -67,6 +67,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertFalse(ascend_config.enable_ffn_chunking)
+        self.assertFalse(ascend_config.ffn_chunk_memory_debug)
         self.assertEqual(ascend_config.ffn_chunk_live_factor, 3.0)
         self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.0)
         self.assertEqual(ascend_config.ffn_min_chunk_size, 1024)
@@ -117,6 +118,7 @@ class TestAscendConfig(TestBase):
         test_vllm_config.model_config = model_config
         test_vllm_config.additional_config = {
             "enable_ffn_chunking": True,
+            "ffn_chunk_memory_debug": True,
             "ffn_chunk_live_factor": 4,
             "ffn_chunk_target_hidden_factor": 2.5,
             "ffn_min_chunk_size": 2048,
@@ -126,6 +128,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
 
         self.assertTrue(ascend_config.enable_ffn_chunking)
+        self.assertTrue(ascend_config.ffn_chunk_memory_debug)
         self.assertEqual(ascend_config.ffn_chunk_live_factor, 4.0)
         self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.5)
         self.assertEqual(ascend_config.ffn_min_chunk_size, 2048)
@@ -176,6 +179,18 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_ffn_chunk_memory_debug_rejects_graph_mode(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        model_config = self._make_model_config()
+        model_config.enforce_eager = False
+        test_vllm_config.model_config = model_config
+        test_vllm_config.additional_config = {"ffn_chunk_memory_debug": True, "refresh": True}
+
+        with self.assertRaisesRegex(ValueError, "requires eager mode"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_ffn_chunking_rejects_invalid_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         sparse_hf_config = SimpleNamespace(index_topk=512)
@@ -185,6 +200,7 @@ class TestAscendConfig(TestBase):
         test_vllm_config.model_config = model_config
         invalid_configs = [
             ({"enable_ffn_chunking": 1}, "must be a boolean"),
+            ({"ffn_chunk_memory_debug": 1}, "must be a boolean"),
             ({"ffn_chunk_live_factor": True}, "must be a number"),
             ({"ffn_chunk_live_factor": 0}, "finite and positive"),
             ({"ffn_chunk_live_factor": float("nan")}, "finite and positive"),

@@ -183,6 +183,7 @@ def peak_allocated_mib(operation, device: torch.device) -> float | None:
     if device.type != "npu":
         return None
     gc.collect()
+    synchronize(device)
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
     baseline = torch.npu.memory_allocated()

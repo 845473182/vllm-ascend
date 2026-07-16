@@ -266,6 +266,14 @@ class AscendConfig:
                 f"{type(enable_ffn_chunking).__name__}: {enable_ffn_chunking}"
             )
 
+        ffn_chunk_memory_debug = additional_config.get("ffn_chunk_memory_debug", False)
+        if not isinstance(ffn_chunk_memory_debug, bool):
+            raise ValueError(
+                "ffn_chunk_memory_debug must be a boolean, got "
+                f"{type(ffn_chunk_memory_debug).__name__}: {ffn_chunk_memory_debug}"
+            )
+        self.ffn_chunk_memory_debug = ffn_chunk_memory_debug
+
         live_factor = additional_config.get("ffn_chunk_live_factor", 3.0)
         target_hidden_factor = additional_config.get("ffn_chunk_target_hidden_factor", 2.0)
         if isinstance(live_factor, bool) or not isinstance(live_factor, (int, float)):
@@ -307,8 +315,13 @@ class AscendConfig:
         # implementation from model-specific fields such as ``index_topk`` or
         # ``compress_ratios``; deployment configuration owns that decision.
         self.enable_ffn_chunking = enable_ffn_chunking
-        if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
-            raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
+        if (self.enable_ffn_chunking or self.ffn_chunk_memory_debug) and not getattr(
+            vllm_config.model_config, "enforce_eager", False
+        ):
+            raise ValueError(
+                "enable_ffn_chunking and ffn_chunk_memory_debug currently require eager mode; "
+                "set enforce_eager=true."
+            )
         if self.enable_ffn_chunking:
             logger.info_once(
                 "[fused_moe] MoE FFN token chunking is enabled for routed experts: "
@@ -316,6 +329,12 @@ class AscendConfig:
                 self.ffn_chunk_live_factor,
                 self.ffn_chunk_target_hidden_factor,
                 self.ffn_min_chunk_size,
+            )
+        if self.ffn_chunk_memory_debug:
+            logger.warning_once(
+                "[fused_moe] FFN memory debug is enabled. The first non-profile Routed Expert FFN "
+                "at each new routed-token high-water mark will synchronize the NPU and reset "
+                "peak-memory statistics; use only for isolated diagnostics."
             )
 
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)

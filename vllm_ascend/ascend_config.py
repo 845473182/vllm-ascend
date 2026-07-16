@@ -303,11 +303,10 @@ class AscendConfig:
         if self.ffn_min_chunk_size <= 0:
             raise ValueError(f"ffn_min_chunk_size must be positive, got {self.ffn_min_chunk_size}")
 
-        self.enable_ffn_chunking = enable_ffn_chunking and use_sparse
-        if enable_ffn_chunking and not use_sparse:
-            logger.warning_once(
-                "enable_ffn_chunking is ignored because the model does not use SFA sparse Attention."
-            )
+        # FFN chunking is an explicit opt-in. Do not infer the Attention
+        # implementation from model-specific fields such as ``index_topk`` or
+        # ``compress_ratios``; deployment configuration owns that decision.
+        self.enable_ffn_chunking = enable_ffn_chunking
         if self.enable_ffn_chunking and not getattr(vllm_config.model_config, "enforce_eager", False):
             raise ValueError("enable_ffn_chunking currently requires eager mode; set enforce_eager=true.")
         if self.enable_ffn_chunking:

@@ -108,7 +108,7 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_ffn_chunking_is_enabled_only_for_eager_sfa_sparse_model(self, mock_fix_incompatible_config):
+    def test_ffn_chunking_is_enabled_by_explicit_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         sparse_hf_config = SimpleNamespace(index_topk=512)
         model_config = self._make_model_config(is_deepseek_mla=True)
@@ -132,7 +132,7 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_ffn_chunking_is_ignored_for_non_sparse_model(self, mock_fix_incompatible_config):
+    def test_ffn_chunking_does_not_require_sparse_attention_marker(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         model_config = self._make_model_config()
         model_config.hf_config = SimpleNamespace()
@@ -142,11 +142,11 @@ class TestAscendConfig(TestBase):
 
         ascend_config = init_ascend_config(test_vllm_config)
 
-        self.assertFalse(ascend_config.enable_ffn_chunking)
+        self.assertTrue(ascend_config.enable_ffn_chunking)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_ffn_chunking_is_ignored_for_compressed_sparse_model(self, mock_fix_incompatible_config):
+    def test_ffn_chunking_does_not_inspect_sparse_attention_variant(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         compressed_hf_config = SimpleNamespace(index_topk=512, compress_ratios=[4])
         model_config = self._make_model_config(is_deepseek_mla=True)
@@ -157,7 +157,7 @@ class TestAscendConfig(TestBase):
 
         ascend_config = init_ascend_config(test_vllm_config)
 
-        self.assertFalse(ascend_config.enable_ffn_chunking)
+        self.assertTrue(ascend_config.enable_ffn_chunking)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

@@ -26,8 +26,6 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
-    balanced_chunk_ranges,
-    estimate_moe_ffn_num_chunks,
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
@@ -106,12 +104,10 @@ class MoECommMethod(ABC):
         ascend_config = get_ascend_config()
         self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
         self.ffn_chunk_memory_debug = getattr(ascend_config, "ffn_chunk_memory_debug", False) is True
-        self._ffn_chunk_memory_debug_max_tokens = -1
+        self.ffn_chunk_size = ascend_config.ffn_chunk_size
+        self._ffn_chunk_memory_debug_logged = False
         self._last_ffn_num_chunks = 1
         if self.enable_ffn_chunking:
-            self.ffn_chunk_live_factor = ascend_config.ffn_chunk_live_factor
-            self.ffn_chunk_target_hidden_factor = ascend_config.ffn_chunk_target_hidden_factor
-            self.ffn_min_chunk_size = ascend_config.ffn_min_chunk_size
             self._ffn_chunking_active_logged = False
 
     def prepare(
@@ -174,11 +170,13 @@ class MoECommMethod(ABC):
         )
 
         apply_mlp = self._apply_mlp_with_optional_chunking if self.enable_ffn_chunking else self._apply_mlp
-        if (
+        should_debug_memory = (
             self.ffn_chunk_memory_debug
-            and mlp_compute_input.hidden_states.shape[0] > self._ffn_chunk_memory_debug_max_tokens
+            and not self._ffn_chunk_memory_debug_logged
             and not getattr(_EXTRA_CTX, "in_profile_run", False)
-        ):
+            and self._estimate_ffn_num_chunks(mlp_compute_input) > 1
+        )
+        if should_debug_memory:
             mlp_output, before_gmm2_evt = self._apply_mlp_with_memory_debug(mlp_compute_input, apply_mlp)
         else:
             mlp_output, before_gmm2_evt = apply_mlp(mlp_compute_input)
@@ -202,77 +200,44 @@ class MoECommMethod(ABC):
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> tuple[torch.Tensor, object | None]:
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
 
+    def _estimate_ffn_num_chunks(self, mlp_compute_input: MoEMlpComputeInput) -> int:
+        if not supports_moe_ffn_chunking(mlp_compute_input):
+            return 1
+        num_tokens = mlp_compute_input.hidden_states.shape[0]
+        return max(1, (num_tokens + self.ffn_chunk_size - 1) // self.ffn_chunk_size)
+
     def _apply_mlp_with_memory_debug(
         self,
         mlp_compute_input: MoEMlpComputeInput,
         apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
     ) -> tuple[torch.Tensor, object | None]:
-        """Measure one Routed Expert FFN high-water invocation in isolation."""
+        """Log the peak allocated memory of one chunk-eligible Routed Expert FFN."""
         torch.npu.synchronize()
         torch.npu.reset_peak_memory_stats()
         allocated_before = int(torch.npu.memory_allocated())
-        reserved_before = int(torch.npu.memory_reserved())
 
         result = apply_mlp(mlp_compute_input)
 
         torch.npu.synchronize()
-        allocated_after = int(torch.npu.memory_allocated())
-        reserved_after = int(torch.npu.memory_reserved())
         peak_allocated = int(torch.npu.max_memory_allocated())
         peak_growth = max(0, peak_allocated - allocated_before)
-        retained_delta = allocated_after - allocated_before
-        # The FFN output remains live after this scope. Subtract both the
-        # entry and exit live sets so this metric better represents temporary
-        # GMM/SwiGLU activations that chunking is intended to reduce.
-        transient_peak = max(0, peak_allocated - max(allocated_before, allocated_after))
-        reserved_delta = reserved_after - reserved_before
-
-        mlp_output = result[0]
-        input_bytes = mlp_compute_input.hidden_states.numel() * mlp_compute_input.hidden_states.element_size()
-        output_bytes = mlp_output.numel() * mlp_output.element_size()
         num_tokens = mlp_compute_input.hidden_states.shape[0]
-        chunk_sizes = [end - start for start, end in balanced_chunk_ranges(num_tokens, self._last_ffn_num_chunks)]
-        largest_chunk_ratio = max(chunk_sizes) / num_tokens if num_tokens else 1.0
         rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_available() and torch.distributed.is_initialized()
             else 0
         )
-        if self._last_ffn_num_chunks > 1:
-            mode = "chunked"
-        elif self.enable_ffn_chunking:
-            mode = "bypassed"
-        else:
-            mode = "no_chunk"
         logger.warning(
-            "[fused_moe][ffn_memory_debug] rank=%s, mode=%s, comm_method=%s, routed_tokens=%s, "
-            "num_chunks=%s, chunk_sizes=%s, largest_chunk_ratio=%.3f, "
-            "input=%.3f MiB, output=%.3f MiB | "
-            "allocated: before=%.3f MiB, peak=%.3f MiB, after=%.3f MiB, "
-            "peak_growth=%.3f MiB, retained_delta=%+.3f MiB, "
-            "transient_peak_above_live=%.3f MiB | "
-            "reserved: before=%.3f MiB, after=%.3f MiB, delta=%+.3f MiB. "
-            "Metrics cover the PyTorch NPU caching allocator only.",
+            "[MOE_MEMORY] rank=%s ffn_chunk=%s routed_tokens=%s num_chunks=%s "
+            "moe_peak_allocated=%.3f MiB moe_peak_increase=%.3f MiB",
             rank,
-            mode,
-            type(self).__name__,
+            "ON" if self.enable_ffn_chunking else "OFF",
             num_tokens,
             self._last_ffn_num_chunks,
-            chunk_sizes,
-            largest_chunk_ratio,
-            input_bytes / _MIB,
-            output_bytes / _MIB,
-            allocated_before / _MIB,
             peak_allocated / _MIB,
-            allocated_after / _MIB,
             peak_growth / _MIB,
-            retained_delta / _MIB,
-            transient_peak / _MIB,
-            reserved_before / _MIB,
-            reserved_after / _MIB,
-            reserved_delta / _MIB,
         )
-        self._ffn_chunk_memory_debug_max_tokens = num_tokens
+        self._ffn_chunk_memory_debug_logged = True
         return result
 
     def _apply_mlp_with_optional_chunking(
@@ -281,26 +246,11 @@ class MoECommMethod(ABC):
     ) -> tuple[torch.Tensor, object | None]:
         """Chunk only the local routed expert MLP, never dispatch/combine."""
         self._last_ffn_num_chunks = 1
-        if not supports_moe_ffn_chunking(mlp_compute_input):
-            return self._apply_mlp(mlp_compute_input)
-
         hidden_states = mlp_compute_input.hidden_states
         intermediate_size = getattr(self.moe_config, "intermediate_size_per_partition", -1)
         if intermediate_size <= 0:
             intermediate_size = self.moe_config.intermediate_size
-        # The Dense-FFN heuristic assumes one FFN row per original token.
-        # Routed MoE expands each token into ``experts_per_token`` rows, so use
-        # the corresponding effective intermediate width for the same memory
-        # target. The actual minimum-size cap still uses local routed rows.
-        num_chunks = estimate_moe_ffn_num_chunks(
-            num_routed_tokens=hidden_states.shape[0],
-            hidden_size=hidden_states.shape[-1],
-            intermediate_size=intermediate_size,
-            experts_per_token=self.moe_config.experts_per_token,
-            live_factor=self.ffn_chunk_live_factor,
-            target_hidden_factor=self.ffn_chunk_target_hidden_factor,
-            min_chunk_size=self.ffn_min_chunk_size,
-        )
+        num_chunks = self._estimate_ffn_num_chunks(mlp_compute_input)
         if num_chunks <= 1:
             return self._apply_mlp(mlp_compute_input)
         self._last_ffn_num_chunks = num_chunks
@@ -309,19 +259,20 @@ class MoECommMethod(ABC):
             logger.info_once(
                 "[fused_moe] MoE FFN token chunking is active: comm_method=%s, "
                 "routed_tokens=%s, hidden_size=%s, intermediate_size=%s, "
-                "experts_per_token=%s, num_chunks=%s.",
+                "experts_per_token=%s, chunk_size=%s, num_chunks=%s.",
                 type(self).__name__,
                 hidden_states.shape[0],
                 hidden_states.shape[-1],
                 intermediate_size,
                 self.moe_config.experts_per_token,
+                self.ffn_chunk_size,
                 num_chunks,
             )
             self._ffn_chunking_active_logged = True
 
         return run_moe_ffn_in_token_chunks(
             mlp_compute_input,
-            num_chunks=num_chunks,
+            chunk_size=self.ffn_chunk_size,
             apply_mlp=self._apply_mlp,
         )
 

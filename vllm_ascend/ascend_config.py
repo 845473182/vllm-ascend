@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -274,42 +273,26 @@ class AscendConfig:
             )
         self.ffn_chunk_memory_debug = ffn_chunk_memory_debug
 
-        live_factor = additional_config.get("ffn_chunk_live_factor", 3.0)
-        target_hidden_factor = additional_config.get("ffn_chunk_target_hidden_factor", 2.0)
-        if isinstance(live_factor, bool) or not isinstance(live_factor, (int, float)):
+        legacy_ffn_chunk_keys = {
+            "ffn_chunk_live_factor",
+            "ffn_chunk_target_hidden_factor",
+            "ffn_min_chunk_size",
+        }
+        configured_legacy_keys = sorted(legacy_ffn_chunk_keys.intersection(additional_config))
+        if configured_legacy_keys:
             raise ValueError(
-                "ffn_chunk_live_factor must be a number, got " f"{type(live_factor).__name__}: {live_factor}"
+                f"{configured_legacy_keys} are no longer supported; configure ffn_chunk_size instead."
             )
-        if isinstance(target_hidden_factor, bool) or not isinstance(target_hidden_factor, (int, float)):
-            raise ValueError(
-                "ffn_chunk_target_hidden_factor must be a number, got "
-                f"{type(target_hidden_factor).__name__}: {target_hidden_factor}"
-            )
-        self.ffn_chunk_live_factor = float(live_factor)
-        self.ffn_chunk_target_hidden_factor = float(target_hidden_factor)
 
-        ffn_min_chunk_size = additional_config.get("ffn_min_chunk_size", 1024)
-        if isinstance(ffn_min_chunk_size, bool) or not isinstance(ffn_min_chunk_size, int):
+        ffn_chunk_size = additional_config.get("ffn_chunk_size", 32768)
+        if isinstance(ffn_chunk_size, bool) or not isinstance(ffn_chunk_size, int):
             raise ValueError(
-                "ffn_min_chunk_size must be an integer, got "
-                f"{type(ffn_min_chunk_size).__name__}: {ffn_min_chunk_size}"
+                "ffn_chunk_size must be an integer, got "
+                f"{type(ffn_chunk_size).__name__}: {ffn_chunk_size}"
             )
-        self.ffn_min_chunk_size = ffn_min_chunk_size
-
-        if not math.isfinite(self.ffn_chunk_live_factor) or self.ffn_chunk_live_factor <= 0:
-            raise ValueError(
-                "ffn_chunk_live_factor must be finite and positive, got " f"{self.ffn_chunk_live_factor}"
-            )
-        if (
-            not math.isfinite(self.ffn_chunk_target_hidden_factor)
-            or self.ffn_chunk_target_hidden_factor <= 0
-        ):
-            raise ValueError(
-                "ffn_chunk_target_hidden_factor must be finite and positive, got "
-                f"{self.ffn_chunk_target_hidden_factor}"
-            )
-        if self.ffn_min_chunk_size <= 0:
-            raise ValueError(f"ffn_min_chunk_size must be positive, got {self.ffn_min_chunk_size}")
+        self.ffn_chunk_size = ffn_chunk_size
+        if self.ffn_chunk_size <= 0:
+            raise ValueError(f"ffn_chunk_size must be positive, got {self.ffn_chunk_size}")
 
         # FFN chunking is an explicit opt-in. Do not infer the Attention
         # implementation from model-specific fields such as ``index_topk`` or
@@ -325,16 +308,13 @@ class AscendConfig:
         if self.enable_ffn_chunking:
             logger.info_once(
                 "[fused_moe] MoE FFN token chunking is enabled for routed experts: "
-                "live_factor=%s, target_hidden_factor=%s, min_chunk_size=%s.",
-                self.ffn_chunk_live_factor,
-                self.ffn_chunk_target_hidden_factor,
-                self.ffn_min_chunk_size,
+                "chunk_size=%s.",
+                self.ffn_chunk_size,
             )
         if self.ffn_chunk_memory_debug:
             logger.warning_once(
-                "[fused_moe] FFN memory debug is enabled. The first non-profile Routed Expert FFN "
-                "at each new routed-token high-water mark will synchronize the NPU and reset "
-                "peak-memory statistics; use only for isolated diagnostics."
+                "[MOE_MEMORY] debug enabled; the first chunk-eligible runtime MoE FFN will be measured. "
+                "NPU synchronization is enabled for this measurement."
             )
 
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)

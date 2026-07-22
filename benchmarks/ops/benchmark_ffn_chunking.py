@@ -3,8 +3,8 @@
 
 """Benchmark routed MoE FFN token chunking.
 
-Compares no chunk, the production shape-aware heuristic, fixed two chunks,
-and fixed four chunks. ``FFN latency`` measures only expert MLP computation on
+Compares no chunk, the production fixed-size strategy, the previous shape-aware
+heuristic, fixed two chunks, and fixed four chunks. ``FFN latency`` measures only expert MLP computation on
 an already dispatched expert-sorted buffer. ``forward latency`` additionally
 includes a deterministic token expansion/permutation and output restoration;
 it intentionally does not benchmark distributed MoE communication.
@@ -37,6 +37,7 @@ except ImportError:
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     balanced_chunk_ranges,
     estimate_moe_ffn_num_chunks,
+    fixed_chunk_ranges,
     run_moe_ffn_in_token_chunks,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -46,8 +47,8 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
 )
 
 
-TOKEN_COUNTS = (256, 512, 1024, 2048, 4096, 8192, 16384)
-STRATEGIES = ("no_chunk", "shape_aware", "fixed_2", "fixed_4")
+TOKEN_COUNTS = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+STRATEGIES = ("no_chunk", "fixed_size", "shape_aware", "fixed_2", "fixed_4")
 MIB = 1024**2
 
 
@@ -145,15 +146,35 @@ class MoEFFNBenchmark:
             offset += count
         return output, None
 
-    def run_ffn(self, value: MoEMlpComputeInput, num_chunks: int) -> torch.Tensor:
+    def run_ffn(
+        self,
+        value: MoEMlpComputeInput,
+        num_chunks: int,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
         if num_chunks == 1:
             return self.apply_mlp(value)[0]
+        if chunk_size is not None:
+            return run_moe_ffn_in_token_chunks(
+                value,
+                chunk_size=chunk_size,
+                apply_mlp=self.apply_mlp,
+            )[0]
         return run_moe_ffn_in_token_chunks(value, num_chunks=num_chunks, apply_mlp=self.apply_mlp)[0]
 
-    def run_forward(self, batch: RoutedBatch, num_chunks: int) -> torch.Tensor:
+    def run_forward(
+        self,
+        batch: RoutedBatch,
+        num_chunks: int,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
         expanded = batch.original.repeat_interleave(self.top_k, dim=0)
         routed = expanded.index_select(0, batch.permutation)
-        routed_output = self.run_ffn(replace(self.make_input(batch), hidden_states=routed), num_chunks)
+        routed_output = self.run_ffn(
+            replace(self.make_input(batch), hidden_states=routed),
+            num_chunks,
+            chunk_size,
+        )
         restored = routed_output.index_select(0, batch.inverse_permutation)
         return restored.reshape(batch.original.shape[0], self.top_k, self.hidden_size).mean(dim=1)
 
@@ -194,20 +215,25 @@ def peak_allocated_mib(operation, device: torch.device) -> float | None:
     return max(0, peak - baseline) / MIB
 
 
-def strategy_chunks(args, strategy: str, routed_tokens: int) -> int:
+def strategy_plan(args, strategy: str, routed_tokens: int) -> tuple[int, int | None]:
     if strategy == "no_chunk":
-        return 1
+        return 1, None
+    if strategy == "fixed_size":
+        return max(1, math.ceil(routed_tokens / args.chunk_size)), args.chunk_size
     if strategy == "shape_aware":
-        return estimate_moe_ffn_num_chunks(
-            num_routed_tokens=routed_tokens,
-            hidden_size=args.hidden_size,
-            intermediate_size=args.intermediate_size,
-            experts_per_token=args.top_k,
-            live_factor=args.live_factor,
-            target_hidden_factor=args.target_hidden_factor,
-            min_chunk_size=args.min_chunk_size,
+        return (
+            estimate_moe_ffn_num_chunks(
+                num_routed_tokens=routed_tokens,
+                hidden_size=args.hidden_size,
+                intermediate_size=args.intermediate_size,
+                experts_per_token=args.top_k,
+                live_factor=args.live_factor,
+                target_hidden_factor=args.target_hidden_factor,
+                min_chunk_size=args.min_chunk_size,
+            ),
+            None,
         )
-    return min(int(strategy.removeprefix("fixed_")), routed_tokens)
+    return min(int(strategy.removeprefix("fixed_")), routed_tokens), None
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,6 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate-size", type=int, default=2048)
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--chunk-size", type=int, default=32768)
     parser.add_argument("--min-chunk-size", type=int, default=1024)
     parser.add_argument("--live-factor", type=float, default=3.0)
     parser.add_argument("--target-hidden-factor", type=float, default=2.0)
@@ -265,13 +292,18 @@ def main() -> None:
         reference = model.run_ffn(mlp_input, 1)
         synchronize(device)
         for strategy in STRATEGIES:
-            num_chunks = strategy_chunks(args, strategy, batch.routed.shape[0])
-            sizes = [end - start for start, end in balanced_chunk_ranges(batch.routed.shape[0], num_chunks)]
-            candidate = model.run_ffn(mlp_input, num_chunks)
+            num_chunks, chunk_size = strategy_plan(args, strategy, batch.routed.shape[0])
+            ranges = (
+                fixed_chunk_ranges(batch.routed.shape[0], chunk_size)
+                if chunk_size is not None
+                else balanced_chunk_ranges(batch.routed.shape[0], num_chunks)
+            )
+            sizes = [end - start for start, end in ranges]
+            candidate = model.run_ffn(mlp_input, num_chunks, chunk_size)
             synchronize(device)
             max_error = float((candidate.float() - reference.float()).abs().max().item())
-            ffn_operation = lambda: model.run_ffn(mlp_input, num_chunks)
-            forward_operation = lambda: model.run_forward(batch, num_chunks)
+            ffn_operation = lambda: model.run_ffn(mlp_input, num_chunks, chunk_size)
+            forward_operation = lambda: model.run_forward(batch, num_chunks, chunk_size)
             row = {
                 "M": num_tokens,
                 "routed_tokens": batch.routed.shape[0],

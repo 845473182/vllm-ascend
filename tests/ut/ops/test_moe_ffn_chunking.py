@@ -9,6 +9,7 @@ from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     chunk_group_list,
     estimate_ffn_num_chunks,
     estimate_moe_ffn_num_chunks,
+    fixed_chunk_ranges,
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
 )
@@ -81,6 +82,21 @@ def test_balanced_chunk_ranges(num_tokens: int, num_chunks: int, expected_sizes:
     assert ranges[-1][1] == num_tokens
     assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
     assert max(sizes) - min(sizes) <= 1
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "chunk_size", "expected_sizes"),
+    [
+        (32768, 32768, [32768]),
+        (65536, 32768, [32768, 32768]),
+        (70000, 32768, [32768, 32768, 4464]),
+    ],
+)
+def test_fixed_chunk_ranges(num_tokens: int, chunk_size: int, expected_sizes: list[int]) -> None:
+    ranges = list(fixed_chunk_ranges(num_tokens, chunk_size))
+    assert [end - start for start, end in ranges] == expected_sizes
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == num_tokens
 
 
 @pytest.mark.parametrize(
@@ -169,6 +185,60 @@ def test_chunked_moe_ffn_slices_per_token_metadata() -> None:
 
     torch.testing.assert_close(torch.cat([item[0] for item in seen]), dynamic_scale)
     torch.testing.assert_close(torch.cat([item[1] for item in seen]), topk_scales)
+
+
+def test_fixed_size_chunking_preserves_order_and_keeps_tail() -> None:
+    hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([3, 2, 4]))
+    seen_sizes: list[int] = []
+
+    def apply_mlp(chunk_input: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
+        seen_sizes.append(chunk_input.hidden_states.shape[0])
+        return chunk_input.hidden_states + 1, None
+
+    output, _ = run_moe_ffn_in_token_chunks(mlp_input, chunk_size=4, apply_mlp=apply_mlp)
+
+    assert seen_sizes == [4, 4, 1]
+    torch.testing.assert_close(output, hidden_states + 1)
+
+
+@pytest.mark.parametrize("num_tokens", [3, 4])
+def test_fixed_size_chunking_bypasses_when_input_fits_one_chunk(num_tokens: int) -> None:
+    hidden_states = torch.randn(num_tokens, 8)
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([num_tokens]))
+    seen: list[MoEMlpComputeInput] = []
+
+    def apply_mlp(value: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
+        seen.append(value)
+        return value.hidden_states, None
+
+    output, _ = run_moe_ffn_in_token_chunks(mlp_input, chunk_size=4, apply_mlp=apply_mlp)
+
+    assert seen == [mlp_input]
+    assert output is hidden_states
+
+
+def test_fixed_size_chunking_rejects_non_positive_chunk_size() -> None:
+    hidden_states = torch.randn(4, 8)
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([4]))
+
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        run_moe_ffn_in_token_chunks(mlp_input, chunk_size=0, apply_mlp=_expert_tagged_mlp)
+
+
+def test_chunk_runner_requires_exactly_one_partition_strategy() -> None:
+    hidden_states = torch.randn(4, 8)
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([2, 2]))
+
+    with pytest.raises(ValueError, match="exactly one"):
+        run_moe_ffn_in_token_chunks(mlp_input, apply_mlp=_expert_tagged_mlp)
+    with pytest.raises(ValueError, match="exactly one"):
+        run_moe_ffn_in_token_chunks(
+            mlp_input,
+            num_chunks=2,
+            chunk_size=2,
+            apply_mlp=_expert_tagged_mlp,
+        )
 
 
 def test_chunked_moe_ffn_preallocates_output_with_actual_result_dtype() -> None:

@@ -13,7 +13,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-"""Shape-aware token chunking helpers for the routed MoE FFN stage."""
+"""Token chunking helpers for the routed MoE FFN stage."""
 
 import math
 from collections.abc import Callable, Iterator
@@ -98,6 +98,17 @@ def balanced_chunk_ranges(num_tokens: int, num_chunks: int) -> Iterator[tuple[in
         start = end
 
 
+def fixed_chunk_ranges(num_tokens: int, chunk_size: int) -> Iterator[tuple[int, int]]:
+    """Yield ordered ranges with at most ``chunk_size`` tokens each."""
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    for start in range(0, num_tokens, chunk_size):
+        yield start, min(start + chunk_size, num_tokens)
+
+
 def chunk_group_list(
     group_list: torch.Tensor,
     group_list_type: int,
@@ -160,25 +171,37 @@ def supports_moe_ffn_chunking(mlp_compute_input: MoEMlpComputeInput) -> bool:
 def run_moe_ffn_in_token_chunks(
     mlp_compute_input: MoEMlpComputeInput,
     *,
-    num_chunks: int,
+    num_chunks: int | None = None,
+    chunk_size: int | None = None,
     apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
 ) -> tuple[torch.Tensor, object | None]:
     """Run only the expert MLP in chunks, leaving dispatch/combine untouched."""
-    if num_chunks <= 0:
+    if (num_chunks is None) == (chunk_size is None):
+        raise ValueError("exactly one of num_chunks or chunk_size must be set")
+    if num_chunks is not None and num_chunks <= 0:
         raise ValueError(f"num_chunks must be positive, got {num_chunks}")
-    if num_chunks == 1:
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    hidden_states = mlp_compute_input.hidden_states
+    num_tokens = hidden_states.shape[0]
+    if num_chunks == 1 or (chunk_size is not None and num_tokens <= chunk_size):
         return apply_mlp(mlp_compute_input)
     if not supports_moe_ffn_chunking(mlp_compute_input):
         raise ValueError("MoE MLP input contains metadata that cannot be safely chunked")
 
-    hidden_states = mlp_compute_input.hidden_states
-    num_tokens = hidden_states.shape[0]
-    if num_chunks > num_tokens:
+    if num_chunks is not None and num_chunks > num_tokens:
         raise ValueError(f"num_chunks ({num_chunks}) cannot exceed num_tokens ({num_tokens})")
+
+    if num_chunks is not None:
+        ranges = balanced_chunk_ranges(num_tokens, num_chunks)
+    else:
+        assert chunk_size is not None
+        ranges = fixed_chunk_ranges(num_tokens, chunk_size)
 
     output: torch.Tensor | None = None
     before_gmm2_event = None
-    for start, end in balanced_chunk_ranges(num_tokens, num_chunks):
+    for start, end in ranges:
         chunk_input = replace(
             mlp_compute_input,
             hidden_states=hidden_states[start:end],

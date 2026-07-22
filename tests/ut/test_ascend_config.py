@@ -68,9 +68,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertFalse(ascend_config.enable_ffn_chunking)
         self.assertFalse(ascend_config.ffn_chunk_memory_debug)
-        self.assertEqual(ascend_config.ffn_chunk_live_factor, 3.0)
-        self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.0)
-        self.assertEqual(ascend_config.ffn_min_chunk_size, 1024)
+        self.assertEqual(ascend_config.ffn_chunk_size, 32768)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -119,9 +117,7 @@ class TestAscendConfig(TestBase):
         test_vllm_config.additional_config = {
             "enable_ffn_chunking": True,
             "ffn_chunk_memory_debug": True,
-            "ffn_chunk_live_factor": 4,
-            "ffn_chunk_target_hidden_factor": 2.5,
-            "ffn_min_chunk_size": 2048,
+            "ffn_chunk_size": 16384,
             "refresh": True,
         }
 
@@ -129,9 +125,7 @@ class TestAscendConfig(TestBase):
 
         self.assertTrue(ascend_config.enable_ffn_chunking)
         self.assertTrue(ascend_config.ffn_chunk_memory_debug)
-        self.assertEqual(ascend_config.ffn_chunk_live_factor, 4.0)
-        self.assertEqual(ascend_config.ffn_chunk_target_hidden_factor, 2.5)
-        self.assertEqual(ascend_config.ffn_min_chunk_size, 2048)
+        self.assertEqual(ascend_config.ffn_chunk_size, 16384)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -201,12 +195,10 @@ class TestAscendConfig(TestBase):
         invalid_configs = [
             ({"enable_ffn_chunking": 1}, "must be a boolean"),
             ({"ffn_chunk_memory_debug": 1}, "must be a boolean"),
-            ({"ffn_chunk_live_factor": True}, "must be a number"),
-            ({"ffn_chunk_live_factor": 0}, "finite and positive"),
-            ({"ffn_chunk_live_factor": float("nan")}, "finite and positive"),
-            ({"ffn_chunk_target_hidden_factor": float("inf")}, "finite and positive"),
-            ({"ffn_min_chunk_size": True}, "must be an integer"),
-            ({"ffn_min_chunk_size": 0}, "must be positive"),
+            ({"ffn_chunk_size": True}, "must be an integer"),
+            ({"ffn_chunk_size": 1.5}, "must be an integer"),
+            ({"ffn_chunk_size": 0}, "must be positive"),
+            ({"ffn_min_chunk_size": 1024}, "no longer supported"),
         ]
 
         for additional_config, error_pattern in invalid_configs:

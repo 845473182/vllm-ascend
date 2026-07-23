@@ -166,6 +166,12 @@ class TestMoECommMethod(TestBase):
         with TemporaryDirectory() as snapshot_dir:
             self.mock_ascend_config.ffn_chunk_memory_snapshot_dir = snapshot_dir
             comm_impl = AllGatherCommImpl(self.moe_config)
+            output = hidden_states.clone() + 1
+
+            def fake_disposing_apply_mlp(value):
+                value.hidden_states.set_(torch.empty(0, dtype=value.hidden_states.dtype))
+                return output, None
+
             with (
                 patch("torch.npu.synchronize"),
                 patch("torch.npu.reset_peak_memory_stats"),
@@ -173,9 +179,12 @@ class TestMoECommMethod(TestBase):
                 patch("torch.npu.max_memory_allocated", return_value=150),
                 patch("torch.npu.memory._record_memory_history") as mock_record_history,
                 patch("torch.npu.memory._dump_snapshot") as mock_dump_snapshot,
+                patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning") as mock_warning,
             ):
-                comm_impl._apply_mlp_with_memory_debug(mlp_input, lambda value: (value.hidden_states + 1, None))
+                actual = comm_impl._apply_mlp_with_memory_debug(mlp_input, fake_disposing_apply_mlp)
 
+        assert actual[0] is output
+        assert mlp_input.hidden_states.shape == (0,)
         assert mock_record_history.call_count == 2
         mock_record_history.assert_any_call(
             enabled="all",
@@ -187,6 +196,8 @@ class TestMoECommMethod(TestBase):
         snapshot_path = mock_dump_snapshot.call_args.args[0]
         assert "moe_ffn_chunk_off_rank0_tokens9_chunks1_" in snapshot_path
         assert snapshot_path.endswith(".pickle")
+        rendered_logs = [call.args[0] % call.args[1:] for call in mock_warning.call_args_list]
+        assert any("routed_tokens=9" in message for message in rendered_logs)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")

@@ -219,6 +219,11 @@ class MoECommMethod(ABC):
         apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
     ) -> tuple[torch.Tensor, object | None]:
         """Log the peak allocated memory of one chunk-eligible Routed Expert FFN."""
+        # Quantized MLP implementations may call dispose_tensor() on the
+        # original input, which mutates its shape to [0]. Preserve the routed
+        # token count before apply_mlp() so OFF-path logs and snapshot names do
+        # not observe the disposed tensor.
+        num_tokens = int(mlp_compute_input.hidden_states.shape[0])
         rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -254,7 +259,6 @@ class MoECommMethod(ABC):
                 try:
                     snapshot_dir = Path(self.ffn_chunk_memory_snapshot_dir)
                     snapshot_dir.mkdir(parents=True, exist_ok=True)
-                    num_tokens = mlp_compute_input.hidden_states.shape[0]
                     chunk_state = "on" if self.enable_ffn_chunking else "off"
                     snapshot_path = snapshot_dir / (
                         f"moe_ffn_chunk_{chunk_state}_rank{rank}_tokens{num_tokens}_"
@@ -272,7 +276,6 @@ class MoECommMethod(ABC):
                     logger.exception("[MOE_MEMORY] failed to stop allocator history.")
 
         peak_growth = max(0, peak_allocated - allocated_before)
-        num_tokens = mlp_compute_input.hidden_states.shape[0]
         logger.warning(
             "[MOE_MEMORY] rank=%s ffn_chunk=%s routed_tokens=%s num_chunks=%s "
             "moe_peak_allocated=%.3f MiB moe_peak_increase=%.3f MiB",

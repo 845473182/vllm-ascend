@@ -68,6 +68,9 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertFalse(ascend_config.enable_ffn_chunking)
         self.assertFalse(ascend_config.ffn_chunk_memory_debug)
+        self.assertIsNone(ascend_config.ffn_chunk_memory_snapshot_dir)
+        self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_rank, 0)
+        self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_max_entries, 100000)
         self.assertEqual(ascend_config.ffn_chunk_size, 32768)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
@@ -117,6 +120,9 @@ class TestAscendConfig(TestBase):
         test_vllm_config.additional_config = {
             "enable_ffn_chunking": True,
             "ffn_chunk_memory_debug": True,
+            "ffn_chunk_memory_snapshot_dir": "/tmp/moe-ffn-memory",
+            "ffn_chunk_memory_snapshot_rank": -1,
+            "ffn_chunk_memory_snapshot_max_entries": 12345,
             "ffn_chunk_size": 16384,
             "refresh": True,
         }
@@ -125,6 +131,9 @@ class TestAscendConfig(TestBase):
 
         self.assertTrue(ascend_config.enable_ffn_chunking)
         self.assertTrue(ascend_config.ffn_chunk_memory_debug)
+        self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_dir, "/tmp/moe-ffn-memory")
+        self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_rank, -1)
+        self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_max_entries, 12345)
         self.assertEqual(ascend_config.ffn_chunk_size, 16384)
 
     @_clean_up_ascend_config
@@ -195,6 +204,13 @@ class TestAscendConfig(TestBase):
         invalid_configs = [
             ({"enable_ffn_chunking": 1}, "must be a boolean"),
             ({"ffn_chunk_memory_debug": 1}, "must be a boolean"),
+            ({"ffn_chunk_memory_snapshot_dir": ""}, "must be a non-empty string"),
+            ({"ffn_chunk_memory_snapshot_rank": -2}, "must be -1"),
+            ({"ffn_chunk_memory_snapshot_max_entries": 0}, "must be positive"),
+            (
+                {"ffn_chunk_memory_snapshot_dir": "/tmp/snapshot"},
+                "requires ffn_chunk_memory_debug=true",
+            ),
             ({"ffn_chunk_size": True}, "must be an integer"),
             ({"ffn_chunk_size": 1.5}, "must be an integer"),
             ({"ffn_chunk_size": 0}, "must be positive"),

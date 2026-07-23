@@ -1,3 +1,4 @@
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -27,6 +28,9 @@ class TestMoECommMethod(TestBase):
         self.mock_ascend_config = MagicMock()
         self.mock_ascend_config.ascend_fusion_config.fusion_ops_gmmswigluquant = False
         self.mock_ascend_config.enable_fused_mc2 = False
+        self.mock_ascend_config.ffn_chunk_memory_snapshot_dir = None
+        self.mock_ascend_config.ffn_chunk_memory_snapshot_rank = 0
+        self.mock_ascend_config.ffn_chunk_memory_snapshot_max_entries = 100000
         self._patch_get_ascend_config = patch(
             "vllm_ascend.ops.fused_moe.moe_comm_method.get_ascend_config",
             return_value=self.mock_ascend_config,
@@ -140,6 +144,49 @@ class TestMoECommMethod(TestBase):
         assert "num_chunks=2" in rendered_log
         assert "moe_peak_allocated=150.000 MiB" in rendered_log
         assert "moe_peak_increase=50.000 MiB" in rendered_log
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")
+    def test_apply_mlp_memory_debug_dumps_snapshot(self, mock_token_dispatcher, mock_prepare_finalize):
+        self.mock_ascend_config.ffn_chunk_memory_debug = True
+        self.mock_ascend_config.ffn_chunk_memory_snapshot_rank = 0
+        self.mock_ascend_config.ffn_chunk_memory_snapshot_max_entries = 123
+        hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+        mlp_input = MoEMlpComputeInput(
+            hidden_states=hidden_states,
+            group_list=torch.tensor([3, 2, 4]),
+            group_list_type=1,
+            dynamic_scale=None,
+            topk_scales=None,
+            weights=MoEWeights(w1=torch.empty(0), w2=torch.empty(0)),
+            quant=MoEQuantParams(),
+            fusion=False,
+        )
+
+        with TemporaryDirectory() as snapshot_dir:
+            self.mock_ascend_config.ffn_chunk_memory_snapshot_dir = snapshot_dir
+            comm_impl = AllGatherCommImpl(self.moe_config)
+            with (
+                patch("torch.npu.synchronize"),
+                patch("torch.npu.reset_peak_memory_stats"),
+                patch("torch.npu.memory_allocated", return_value=100),
+                patch("torch.npu.max_memory_allocated", return_value=150),
+                patch("torch.npu.memory._record_memory_history") as mock_record_history,
+                patch("torch.npu.memory._dump_snapshot") as mock_dump_snapshot,
+            ):
+                comm_impl._apply_mlp_with_memory_debug(mlp_input, lambda value: (value.hidden_states + 1, None))
+
+        assert mock_record_history.call_count == 2
+        mock_record_history.assert_any_call(
+            enabled="all",
+            context="all",
+            stacks="python",
+            max_entries=123,
+        )
+        mock_record_history.assert_any_call(enabled=None)
+        snapshot_path = mock_dump_snapshot.call_args.args[0]
+        assert "moe_ffn_chunk_off_rank0_tokens9_chunks1_" in snapshot_path
+        assert snapshot_path.endswith(".pickle")
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")

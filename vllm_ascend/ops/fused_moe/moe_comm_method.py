@@ -18,6 +18,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from time import time_ns
 
 import torch
 from vllm.logger import logger
@@ -104,6 +106,11 @@ class MoECommMethod(ABC):
         ascend_config = get_ascend_config()
         self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
         self.ffn_chunk_memory_debug = getattr(ascend_config, "ffn_chunk_memory_debug", False) is True
+        self.ffn_chunk_memory_snapshot_dir = getattr(ascend_config, "ffn_chunk_memory_snapshot_dir", None)
+        self.ffn_chunk_memory_snapshot_rank = getattr(ascend_config, "ffn_chunk_memory_snapshot_rank", 0)
+        self.ffn_chunk_memory_snapshot_max_entries = getattr(
+            ascend_config, "ffn_chunk_memory_snapshot_max_entries", 100000
+        )
         self.ffn_chunk_size = ascend_config.ffn_chunk_size
         self._ffn_chunk_memory_debug_logged = False
         self._last_ffn_num_chunks = 1
@@ -212,21 +219,60 @@ class MoECommMethod(ABC):
         apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
     ) -> tuple[torch.Tensor, object | None]:
         """Log the peak allocated memory of one chunk-eligible Routed Expert FFN."""
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        allocated_before = int(torch.npu.memory_allocated())
-
-        result = apply_mlp(mlp_compute_input)
-
-        torch.npu.synchronize()
-        peak_allocated = int(torch.npu.max_memory_allocated())
-        peak_growth = max(0, peak_allocated - allocated_before)
-        num_tokens = mlp_compute_input.hidden_states.shape[0]
         rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_available() and torch.distributed.is_initialized()
             else 0
         )
+        should_dump_snapshot = self.ffn_chunk_memory_snapshot_dir is not None and (
+            self.ffn_chunk_memory_snapshot_rank == -1 or self.ffn_chunk_memory_snapshot_rank == rank
+        )
+
+        history_started = False
+        if should_dump_snapshot:
+            try:
+                torch.npu.memory._record_memory_history(
+                    enabled="all",
+                    context="all",
+                    stacks="python",
+                    max_entries=self.ffn_chunk_memory_snapshot_max_entries,
+                )
+                history_started = True
+            except Exception:
+                logger.exception("[MOE_MEMORY] failed to start allocator history; continuing without a snapshot.")
+
+        torch.npu.synchronize()
+        torch.npu.reset_peak_memory_stats()
+        allocated_before = int(torch.npu.memory_allocated())
+
+        try:
+            result = apply_mlp(mlp_compute_input)
+            torch.npu.synchronize()
+            peak_allocated = int(torch.npu.max_memory_allocated())
+
+            if history_started:
+                try:
+                    snapshot_dir = Path(self.ffn_chunk_memory_snapshot_dir)
+                    snapshot_dir.mkdir(parents=True, exist_ok=True)
+                    num_tokens = mlp_compute_input.hidden_states.shape[0]
+                    chunk_state = "on" if self.enable_ffn_chunking else "off"
+                    snapshot_path = snapshot_dir / (
+                        f"moe_ffn_chunk_{chunk_state}_rank{rank}_tokens{num_tokens}_"
+                        f"chunks{self._last_ffn_num_chunks}_{time_ns()}.pickle"
+                    )
+                    torch.npu.memory._dump_snapshot(str(snapshot_path))
+                    logger.warning("[MOE_MEMORY] allocator snapshot saved: %s", snapshot_path)
+                except Exception:
+                    logger.exception("[MOE_MEMORY] failed to save the allocator snapshot.")
+        finally:
+            if history_started:
+                try:
+                    torch.npu.memory._record_memory_history(enabled=None)
+                except Exception:
+                    logger.exception("[MOE_MEMORY] failed to stop allocator history.")
+
+        peak_growth = max(0, peak_allocated - allocated_before)
+        num_tokens = mlp_compute_input.hidden_states.shape[0]
         logger.warning(
             "[MOE_MEMORY] rank=%s ffn_chunk=%s routed_tokens=%s num_chunks=%s "
             "moe_peak_allocated=%.3f MiB moe_peak_increase=%.3f MiB",

@@ -273,6 +273,46 @@ class AscendConfig:
             )
         self.ffn_chunk_memory_debug = ffn_chunk_memory_debug
 
+        ffn_chunk_memory_snapshot_dir = additional_config.get("ffn_chunk_memory_snapshot_dir")
+        if ffn_chunk_memory_snapshot_dir is not None and (
+            not isinstance(ffn_chunk_memory_snapshot_dir, str) or not ffn_chunk_memory_snapshot_dir.strip()
+        ):
+            raise ValueError("ffn_chunk_memory_snapshot_dir must be a non-empty string or null")
+        self.ffn_chunk_memory_snapshot_dir = ffn_chunk_memory_snapshot_dir
+
+        ffn_chunk_memory_snapshot_rank = additional_config.get("ffn_chunk_memory_snapshot_rank", 0)
+        if isinstance(ffn_chunk_memory_snapshot_rank, bool) or not isinstance(ffn_chunk_memory_snapshot_rank, int):
+            raise ValueError(
+                "ffn_chunk_memory_snapshot_rank must be an integer, got "
+                f"{type(ffn_chunk_memory_snapshot_rank).__name__}: {ffn_chunk_memory_snapshot_rank}"
+            )
+        if ffn_chunk_memory_snapshot_rank < -1:
+            raise ValueError(
+                "ffn_chunk_memory_snapshot_rank must be -1 (all ranks) or a non-negative rank, got "
+                f"{ffn_chunk_memory_snapshot_rank}"
+            )
+        self.ffn_chunk_memory_snapshot_rank = ffn_chunk_memory_snapshot_rank
+
+        ffn_chunk_memory_snapshot_max_entries = additional_config.get(
+            "ffn_chunk_memory_snapshot_max_entries", 100000
+        )
+        if isinstance(ffn_chunk_memory_snapshot_max_entries, bool) or not isinstance(
+            ffn_chunk_memory_snapshot_max_entries, int
+        ):
+            raise ValueError(
+                "ffn_chunk_memory_snapshot_max_entries must be an integer, got "
+                f"{type(ffn_chunk_memory_snapshot_max_entries).__name__}: "
+                f"{ffn_chunk_memory_snapshot_max_entries}"
+            )
+        if ffn_chunk_memory_snapshot_max_entries <= 0:
+            raise ValueError(
+                "ffn_chunk_memory_snapshot_max_entries must be positive, got "
+                f"{ffn_chunk_memory_snapshot_max_entries}"
+            )
+        self.ffn_chunk_memory_snapshot_max_entries = ffn_chunk_memory_snapshot_max_entries
+        if self.ffn_chunk_memory_snapshot_dir is not None and not self.ffn_chunk_memory_debug:
+            raise ValueError("ffn_chunk_memory_snapshot_dir requires ffn_chunk_memory_debug=true")
+
         legacy_ffn_chunk_keys = {
             "ffn_chunk_live_factor",
             "ffn_chunk_target_hidden_factor",
@@ -315,6 +355,13 @@ class AscendConfig:
             logger.warning_once(
                 "[MOE_MEMORY] debug enabled; the first chunk-eligible runtime MoE FFN will be measured. "
                 "NPU synchronization is enabled for this measurement."
+            )
+        if self.ffn_chunk_memory_snapshot_dir is not None:
+            logger.warning_once(
+                "[MOE_MEMORY] allocator history snapshot is enabled: directory=%s, rank=%s, max_entries=%s.",
+                self.ffn_chunk_memory_snapshot_dir,
+                "all" if self.ffn_chunk_memory_snapshot_rank == -1 else self.ffn_chunk_memory_snapshot_rank,
+                self.ffn_chunk_memory_snapshot_max_entries,
             )
 
         self.enable_kv_nz = additional_config.get("enable_kv_nz", False)

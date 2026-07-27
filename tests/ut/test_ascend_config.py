@@ -71,7 +71,7 @@ class TestAscendConfig(TestBase):
         self.assertIsNone(ascend_config.ffn_chunk_memory_snapshot_dir)
         self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_rank, 0)
         self.assertEqual(ascend_config.ffn_chunk_memory_snapshot_max_entries, 100000)
-        self.assertEqual(ascend_config.ffn_chunk_size, 32768)
+        self.assertEqual(ascend_config.ffn_chunk_size, 4096)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)

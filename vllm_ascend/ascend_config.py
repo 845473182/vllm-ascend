@@ -324,7 +324,7 @@ class AscendConfig:
                 f"{configured_legacy_keys} are no longer supported; configure ffn_chunk_size instead."
             )
 
-        ffn_chunk_size = additional_config.get("ffn_chunk_size", 32768)
+        ffn_chunk_size = additional_config.get("ffn_chunk_size", 4096)
         if isinstance(ffn_chunk_size, bool) or not isinstance(ffn_chunk_size, int):
             raise ValueError(
                 "ffn_chunk_size must be an integer, got "

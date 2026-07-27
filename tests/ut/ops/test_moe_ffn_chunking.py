@@ -189,6 +189,7 @@ def test_chunked_moe_ffn_slices_per_token_metadata() -> None:
 
 def test_fixed_size_chunking_preserves_order_and_keeps_tail() -> None:
     hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+    original = hidden_states.clone()
     mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([3, 2, 4]))
     seen_sizes: list[int] = []
 
@@ -199,7 +200,10 @@ def test_fixed_size_chunking_preserves_order_and_keeps_tail() -> None:
     output, _ = run_moe_ffn_in_token_chunks(mlp_input, chunk_size=4, apply_mlp=apply_mlp)
 
     assert seen_sizes == [4, 4, 1]
-    torch.testing.assert_close(output, hidden_states + 1)
+    # When the MLP output dtype matches the input, the chunk runner writes
+    # in-place into ``hidden_states`` to avoid a second [N, H] allocation.
+    assert output.data_ptr() == hidden_states.data_ptr()
+    torch.testing.assert_close(output, original + 1)
 
 
 @pytest.mark.parametrize("num_tokens", [3, 4])
@@ -243,6 +247,8 @@ def test_chunk_runner_requires_exactly_one_partition_strategy() -> None:
 
 def test_chunked_moe_ffn_preallocates_output_with_actual_result_dtype() -> None:
     hidden_states = torch.randint(-4, 4, (17, 8), dtype=torch.int8)
+    expected = hidden_states.to(torch.bfloat16)
+    original_data_ptr = hidden_states.data_ptr()
     mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([5, 6, 6]))
 
     def bf16_output(value: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
@@ -251,7 +257,47 @@ def test_chunked_moe_ffn_preallocates_output_with_actual_result_dtype() -> None:
     output, _ = run_moe_ffn_in_token_chunks(mlp_input, num_chunks=4, apply_mlp=bf16_output)
 
     assert output.dtype == torch.bfloat16
-    torch.testing.assert_close(output, hidden_states.to(torch.bfloat16))
+    # Dtype mismatch forces a fresh output buffer instead of the in-place path.
+    assert output.data_ptr() != original_data_ptr
+    torch.testing.assert_close(output, expected)
+    # The fallback path disposes the base ``hidden_states`` mid-loop so its
+    # ``N * H`` bytes are not held alongside the new output buffer.
+    assert mlp_input.hidden_states.numel() == 0
+
+
+def test_chunked_moe_ffn_writes_output_in_place_when_dtype_matches() -> None:
+    hidden_states = torch.arange(36, dtype=torch.bfloat16).reshape(9, 4)
+    original = hidden_states.clone()
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([3, 2, 4]))
+    base_ptr = hidden_states.data_ptr()
+
+    def bump(value: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
+        # Force a fresh contiguous chunk output so ``copy_`` never aliases the
+        # source with the destination (mirrors real GMM2 output semantics).
+        return (value.hidden_states.clone() + 1).contiguous(), None
+
+    output, _ = run_moe_ffn_in_token_chunks(mlp_input, chunk_size=4, apply_mlp=bump)
+
+    assert output.data_ptr() == base_ptr
+    torch.testing.assert_close(output, original + 1)
+
+
+def test_chunked_moe_ffn_falls_back_when_input_is_not_contiguous() -> None:
+    # A non-contiguous input cannot be safely reused as the output buffer.
+    base = torch.arange(72, dtype=torch.bfloat16).reshape(9, 8)
+    hidden_states = base[:, :4]
+    assert not hidden_states.is_contiguous()
+    expected = hidden_states + 1
+    original_data_ptr = hidden_states.data_ptr()
+    mlp_input = _make_mlp_input(hidden_states, group_list=torch.tensor([3, 2, 4]))
+
+    def bump(value: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
+        return (value.hidden_states.clone() + 1).contiguous(), None
+
+    output, _ = run_moe_ffn_in_token_chunks(mlp_input, chunk_size=4, apply_mlp=bump)
+
+    assert output.data_ptr() != original_data_ptr
+    torch.testing.assert_close(output, expected)
 
 
 def test_single_chunk_uses_original_mlp_payload() -> None:

@@ -183,6 +183,7 @@ class MoECommMethod(ABC):
             and not getattr(_EXTRA_CTX, "in_profile_run", False)
             and self._estimate_ffn_num_chunks(mlp_compute_input) > 1
         )
+        # print(f"should_debug_memory={should_debug_memory}")
         if should_debug_memory:
             mlp_output, before_gmm2_evt = self._apply_mlp_with_memory_debug(mlp_compute_input, apply_mlp)
         else:
@@ -232,7 +233,7 @@ class MoECommMethod(ABC):
         should_dump_snapshot = self.ffn_chunk_memory_snapshot_dir is not None and (
             self.ffn_chunk_memory_snapshot_rank == -1 or self.ffn_chunk_memory_snapshot_rank == rank
         )
-
+        # print(f"should_dump_snapshot={should_dump_snapshot}")
         history_started = False
         if should_dump_snapshot:
             try:

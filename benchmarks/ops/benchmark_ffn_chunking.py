@@ -245,7 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate-size", type=int, default=2048)
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
-    parser.add_argument("--chunk-size", type=int, default=32768)
+    parser.add_argument("--chunk-size", type=int, default=4096)
     parser.add_argument("--min-chunk-size", type=int, default=1024)
     parser.add_argument("--live-factor", type=float, default=3.0)
     parser.add_argument("--target-hidden-factor", type=float, default=2.0)

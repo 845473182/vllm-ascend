@@ -67,17 +67,26 @@ class TestMoECommMethod(TestBase):
         self.moe_config.intermediate_size_per_partition = 8
         self.moe_config.intermediate_size = 8
         comm_impl = AllGatherCommImpl(self.moe_config)
-        hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
-        mlp_input = MoEMlpComputeInput(
-            hidden_states=hidden_states,
-            group_list=torch.tensor([3, 2, 4]),
-            group_list_type=1,
-            dynamic_scale=None,
-            topk_scales=None,
-            weights=MoEWeights(w1=torch.empty(0), w2=torch.empty(0)),
-            quant=MoEQuantParams(),
-            fusion=False,
-        )
+        # Use a fresh input tensor per invocation because the chunk runner
+        # now writes results back into ``hidden_states`` in place when the
+        # output dtype matches, so the second call would otherwise observe
+        # the first call's mutations.
+        first_hidden_states = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+        original = first_hidden_states.clone()
+        second_hidden_states = original.clone()
+
+        def _make_input(hidden: torch.Tensor) -> MoEMlpComputeInput:
+            return MoEMlpComputeInput(
+                hidden_states=hidden,
+                group_list=torch.tensor([3, 2, 4]),
+                group_list_type=1,
+                dynamic_scale=None,
+                topk_scales=None,
+                weights=MoEWeights(w1=torch.empty(0), w2=torch.empty(0)),
+                quant=MoEQuantParams(),
+                fusion=False,
+            )
+
         seen_group_lists = []
 
         def fake_apply_mlp(value):
@@ -86,10 +95,11 @@ class TestMoECommMethod(TestBase):
 
         comm_impl._apply_mlp = fake_apply_mlp
         with patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.info_once") as mock_info_once:
-            output, _ = comm_impl._apply_mlp_with_optional_chunking(mlp_input)
-            comm_impl._apply_mlp_with_optional_chunking(mlp_input)
+            output, _ = comm_impl._apply_mlp_with_optional_chunking(_make_input(first_hidden_states))
+            comm_impl._apply_mlp_with_optional_chunking(_make_input(second_hidden_states))
 
-        torch.testing.assert_close(output, hidden_states + 1)
+        torch.testing.assert_close(output, original + 1)
+        assert output.data_ptr() == first_hidden_states.data_ptr()
         mock_info_once.assert_called_once()
         assert "MoE FFN token chunking is active" in mock_info_once.call_args.args[0]
         assert [value.tolist() for value in seen_group_lists] == [

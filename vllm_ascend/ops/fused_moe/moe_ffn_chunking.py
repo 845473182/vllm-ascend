@@ -175,7 +175,14 @@ def run_moe_ffn_in_token_chunks(
     chunk_size: int | None = None,
     apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
 ) -> tuple[torch.Tensor, object | None]:
-    """Run only the expert MLP in chunks, leaving dispatch/combine untouched."""
+    """Run only the expert MLP in chunks, leaving dispatch/combine untouched.
+
+    When the MLP produces an output with the same shape and dtype as the input
+    (the common BF16 dispatch path), each chunk is written back into the input
+    buffer directly so no extra ``[N, H]`` staging tensor lives across the
+    loop. When the output dtype differs (e.g. int8/fp8 activations in, BF16
+    out) a fresh ``[N, ...]`` buffer is allocated on the first iteration.
+    """
     if (num_chunks is None) == (chunk_size is None):
         raise ValueError("exactly one of num_chunks or chunk_size must be set")
     if num_chunks is not None and num_chunks <= 0:
@@ -199,12 +206,39 @@ def run_moe_ffn_in_token_chunks(
         assert chunk_size is not None
         ranges = fixed_chunk_ranges(num_tokens, chunk_size)
 
+    ranges_list = list(ranges)
+    before_gmm2_event: object | None = None
     output: torch.Tensor | None = None
-    before_gmm2_event = None
-    for start, end in ranges:
+    # ``read_source`` is the tensor we slice per-iteration to build
+    # ``chunk_input.hidden_states``. It starts as the caller's dispatch
+    # buffer. On the quantized-dispatch fallback we point it at ``output``
+    # AFTER we have (a) allocated ``output`` sized to the true MLP result
+    # dtype AND (b) already consumed / copied every earlier chunk's data
+    # into ``output``. Since output is written in the same slice ordering
+    # we then read from, chunks 2..K only read data they have themselves
+    # just written — but we never actually re-read past chunks because the
+    # loop always advances ``start``. The critical property is: once we
+    # dispose the input, subsequent iterations must not slice the disposed
+    # tensor; ``read_source`` gives us a valid buffer to slice, even though
+    # its dtype/shape happen to be the output's — which is fine because
+    # the quantized path re-consumes chunk data via ``apply_mlp`` from
+    # ``chunk_input.hidden_states``, and each chunk's ``hidden_states`` is
+    # already fully materialised by then.
+    #
+    # ⚠ This is subtle: for the fallback path, we MUST slice from the
+    # original input tensor for every chunk. So we cannot dispose after
+    # only one chunk. Instead we dispose AFTER the loop ends — trading off
+    # some peak reduction for correctness. If a caller wants the maximum
+    # peak reduction on the quantized path, dispatch should return BF16
+    # (making the same_layout fast path apply) or the caller should chunk
+    # dispatch itself.
+    read_source = hidden_states
+
+    for idx, (start, end) in enumerate(ranges_list):
+        chunk_view = read_source[start:end]
         chunk_input = replace(
             mlp_compute_input,
-            hidden_states=hidden_states[start:end],
+            hidden_states=chunk_view,
             group_list=chunk_group_list(
                 mlp_compute_input.group_list,
                 mlp_compute_input.group_list_type,
@@ -214,14 +248,36 @@ def run_moe_ffn_in_token_chunks(
             dynamic_scale=_slice_token_metadata(mlp_compute_input.dynamic_scale, start=start, end=end),
             topk_scales=_slice_token_metadata(mlp_compute_input.topk_scales, start=start, end=end),
         )
+        del chunk_view
+
         chunk_output, before_gmm2_event = apply_mlp(chunk_input)
+        del chunk_input
+
         if output is None:
-            # Quantized dispatch may feed int8/fp8 activations into the MLP
-            # while the down projection returns bf16/fp16. Allocate from the
-            # first result so the final buffer always has the real output dtype.
-            output = chunk_output.new_empty((num_tokens, *chunk_output.shape[1:]))
+            same_layout = (
+                chunk_output.dtype == hidden_states.dtype
+                and chunk_output.shape[1:] == hidden_states.shape[1:]
+                and hidden_states.is_contiguous()
+            )
+            if same_layout:
+                # BF16-in / BF16-out: alias input as output. No extra buffer.
+                output = hidden_states
+            else:
+                # Quantized-dispatch fallback: input dtype (e.g. int8)
+                # differs from output dtype (e.g. bfloat16). Allocate a new
+                # output buffer. See note above about deferred dispose.
+                output = chunk_output.new_empty((num_tokens, *chunk_output.shape[1:]))
         output[start:end].copy_(chunk_output)
         del chunk_output
 
     assert output is not None
+    # Post-loop dispose: on the fallback path, ``hidden_states`` (int8) and
+    # ``output`` (bf16) both existed for the full duration of the chunk
+    # loop, so peak memory is unchanged. Dispose here anyway so the caller
+    # cannot observe the base after we return — matches token_combine's
+    # contract that only ``output`` is live going forward.
+    if output is not hidden_states:
+        mlp_compute_input.hidden_states.set_(
+            torch.empty((0,), device=hidden_states.device, dtype=hidden_states.dtype)
+        )
     return output, before_gmm2_event

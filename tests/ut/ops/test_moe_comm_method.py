@@ -527,9 +527,9 @@ class TestMoECommMethod(TestBase):
         with patch("torch.npu.current_stream", mock_stream):
             result = comm_impl.fused_experts(fused_experts_input=self._make_e2e_fused_input(hidden_states))
 
-        # 9 tokens with chunk_size=4 -> 3 chunks of [4, 4, 1].
-        assert dispatch_calls == [4, 4, 1]
-        assert apply_calls == [4, 4, 1]
+        # 9 tokens with chunk_size=4 -> K=3 balanced chunks of [3, 3, 3].
+        assert dispatch_calls == [3, 3, 3]
+        assert apply_calls == [3, 3, 3]
         assert mock_td_instance.token_combine.call_count == 3
         # Partial chunk outputs are assembled into one full routed_out.
         torch.testing.assert_close(result.routed_out, hidden_states * 2)
@@ -562,7 +562,7 @@ class TestMoECommMethod(TestBase):
         ):
             result = comm_impl.fused_experts(fused_experts_input=self._make_e2e_fused_input(hidden_states))
 
-        # 4 tokens <= chunk_size 8 -> base single-pass path, no chunking.
+        # ceil(4 / 8) == 1 chunk -> base single-pass path, no chunking.
         assert result == "base_result"
         mock_base.assert_called_once()
         mock_e2e.assert_not_called()
@@ -570,7 +570,68 @@ class TestMoECommMethod(TestBase):
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAll2AllV")
-    def test_alltoall_e2e_chunking_falls_back_when_dp_token_counts_diverge(
+    def test_alltoall_e2e_chunking_uses_uniform_k_when_dp_token_counts_diverge(
+        self, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
+    ):
+        mock_get_forward_context.return_value = MagicMock()
+        self.mock_ascend_config.enable_ffn_chunking = True
+        self.mock_ascend_config.ffn_chunk_size = 2
+        self.mock_ascend_config.dp_allreduce_on_npu = False
+        self.moe_config.dp_size = 2
+
+        dispatch_calls = []
+
+        def fake_dispatch(token_dispatch_input):
+            hs = token_dispatch_input.hidden_states
+            dispatch_calls.append(hs.shape[0])
+            return MoETokenDispatchOutput(
+                hidden_states=hs.clone(),
+                group_list=torch.tensor([hs.shape[0]]),
+                group_list_type=1,
+                combine_metadata=MagicMock(expanded_row_idx=None),
+                dynamic_scale=None,
+                topk_scales=None,
+            )
+
+        mock_td_instance = MagicMock()
+        mock_td_instance.token_dispatch.side_effect = fake_dispatch
+        mock_td_instance.token_combine.side_effect = lambda hidden_states, combine_metadata: hidden_states
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        def fake_all_reduce(payload, op=None, group=None):
+            # This rank: 9 tokens, k_local = ceil(9/2) = 5.
+            # Peer rank: 6 tokens, k_local = ceil(6/2) = 3.
+            # MAX all-reduce yields k_max=5 and global_min_tokens=6,
+            # so the uniform chunk count is min(5, 6) = 5? No: the uniform
+            # count is min(k_max=5, global_min_tokens=6) = 5 — but the peer
+            # with 6 tokens cannot make 5 non-empty balanced chunks... it
+            # can (sizes [2,1,1,1,1]). Every rank issues exactly 5
+            # collectives, call counts match.
+            payload[0] = 5
+            payload[1] = -6
+
+        comm_impl = AlltoAllCommImpl(self.moe_config)
+        comm_impl._apply_mlp = lambda value: (value.hidden_states.clone(), None)
+        hidden_states = torch.arange(72, dtype=torch.bfloat16).reshape(9, 8)
+
+        with (
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_dp_group") as mock_get_dp_group,
+            patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+            patch("torch.npu.current_stream", MagicMock()),
+        ):
+            mock_get_dp_group.return_value = MagicMock(world_size=2, cpu_group=MagicMock())
+            result = comm_impl.fused_experts(fused_experts_input=self._make_e2e_fused_input(hidden_states))
+
+        # K=5 uniform chunks; this rank splits 9 tokens into [2,2,2,2,1].
+        assert dispatch_calls == [2, 2, 2, 2, 1]
+        assert mock_td_instance.token_combine.call_count == 5
+        assert result.expert_tokens.tolist() == [9]
+        assert comm_impl._last_ffn_num_chunks == 5
+
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAll2AllV")
+    def test_alltoall_e2e_chunking_falls_back_when_global_min_tokens_too_small(
         self, mock_token_dispatcher, mock_prepare_finalize, mock_get_forward_context
     ):
         mock_get_forward_context.return_value = MagicMock()
@@ -581,13 +642,14 @@ class TestMoECommMethod(TestBase):
         self.moe_config.dp_size = 2
 
         def fake_all_reduce(payload, op=None, group=None):
-            # Another DP rank holds 8 tokens while this rank holds 4:
-            # max=8, min=4 -> not uniform -> every rank must fall back.
-            payload[0] = 8
-            payload[1] = -4
+            # Peer rank is nearly idle: global_min_tokens = 1, so the uniform
+            # chunk count is min(k_max, 1) = 1 -> chunking disabled on ALL
+            # ranks, keeping collective call counts identical.
+            payload[0] = 5
+            payload[1] = -1
 
         comm_impl = AlltoAllCommImpl(self.moe_config)
-        hidden_states = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
+        hidden_states = torch.arange(72, dtype=torch.bfloat16).reshape(9, 8)
 
         with (
             patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_dp_group") as mock_get_dp_group,

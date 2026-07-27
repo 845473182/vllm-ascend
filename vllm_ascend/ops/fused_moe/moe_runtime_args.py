@@ -57,6 +57,8 @@ dataclass directly.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
@@ -251,6 +253,39 @@ def build_mlp_compute_input(
     )
 
 
+def slice_fused_experts_input_along_tokens(
+    fused_experts_input: MoEFusedExpertsInput,
+    start: int,
+    end: int,
+) -> MoEFusedExpertsInput:
+    """Return a shallow copy that only spans tokens ``[start:end]``.
+
+    Slices the per-token fields (``hidden_states``, ``topk_ids``,
+    ``topk_weights``) along dim 0 and the routing side-inputs that live at the
+    same granularity (``mc2_mask``, ``pertoken_scale``). Static topology fields
+    (``weights``, ``quant``, ``routing.expert_map``, ``routing.log2phy``,
+    ``routing.global_redundant_expert_num``, ``routing.apply_router_weight_on_input``)
+    are shared with the original.
+
+    This helper is used by the end-to-end FFN chunk path where dispatch, MLP
+    and combine all run on a chunk of the raw token batch (rather than only
+    the MLP running chunked on already-dispatched tokens).
+    """
+    routing = fused_experts_input.routing
+    sliced_routing = replace(
+        routing,
+        mc2_mask=(routing.mc2_mask[start:end] if routing.mc2_mask is not None else None),
+        pertoken_scale=(routing.pertoken_scale[start:end] if routing.pertoken_scale is not None else None),
+    )
+    return replace(
+        fused_experts_input,
+        hidden_states=fused_experts_input.hidden_states[start:end],
+        topk_ids=fused_experts_input.topk_ids[start:end],
+        topk_weights=fused_experts_input.topk_weights[start:end],
+        routing=sliced_routing,
+    )
+
+
 __all__ = [
     "MoEAllGatherCombineMetadata",
     "MoEAllToAllCombineMetadata",
@@ -267,4 +302,5 @@ __all__ = [
     "build_fused_experts_input",
     "build_token_dispatch_input",
     "build_mlp_compute_input",
+    "slice_fused_experts_input_along_tokens",
 ]

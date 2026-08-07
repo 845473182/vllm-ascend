@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from pathlib import Path
 from time import time_ns
 
 import torch
-from vllm.distributed import get_dp_group
+from vllm.distributed import get_dp_group, get_ep_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -57,6 +58,38 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+
+# Per-call aggregated FFN-chunk logging (one line per chunking event,
+# printed on EP rank 0). Set VLLM_FFN_CHUNK_LOG=0 to silence.
+_FFN_CHUNK_LOG = os.environ.get("VLLM_FFN_CHUNK_LOG", "1") == "1"
+
+
+def _log_ffn_chunk_stats(scope: str, chunk_size: int, num_tokens: int, num_chunks: int) -> None:
+    """All-gather (tokens, chunks) across the EP group and log a single line.
+
+    tokens is the pre-dispatch count for the e2e scope and the post-dispatch
+    routed count for the inner-mlp scope. Every EP rank MUST call this on
+    every fused_experts invocation (the inner-mlp per-rank chunk count varies
+    with routing skew; a conditional call deadlocks the collective). The line
+    is printed on EP rank 0 only when at least one rank actually chunked.
+    """
+    ep_group = get_ep_group()
+    payload = torch.tensor([num_tokens, num_chunks], dtype=torch.int64)
+    gathered = [torch.empty_like(payload) for _ in range(ep_group.world_size)]
+    torch.distributed.all_gather(gathered, payload, group=ep_group.cpu_group)
+    if ep_group.rank_in_group != 0:
+        return
+    tokens = [int(item[0].item()) for item in gathered]
+    chunks = [int(item[1].item()) for item in gathered]
+    if max(chunks) <= 1:
+        return
+    logger.info(
+        "[fused_moe] %s FFN chunking: chunk_size=%s, tokens_per_rank=%s, chunks_per_rank=%s",
+        scope,
+        chunk_size,
+        tokens,
+        chunks,
+    )
 _MIB = 1024**2
 
 
@@ -345,24 +378,16 @@ class MoECommMethod(ABC):
         if intermediate_size <= 0:
             intermediate_size = self.moe_config.intermediate_size
         num_chunks = self._estimate_ffn_num_chunks(mlp_compute_input)
+        if _FFN_CHUNK_LOG:
+            # Gather unconditionally on every rank BEFORE the early return
+            # below: the per-rank chunk count varies with routing skew, so a
+            # conditional all_gather would deadlock the EP group. The helper
+            # prints only when some rank actually chunked.
+            # num_tokens here is the post-dispatch routed count (varies per rank)
+            _log_ffn_chunk_stats("inner-mlp", self.ffn_chunk_size, hidden_states.shape[0], num_chunks)
         if num_chunks <= 1:
             return self._apply_mlp(mlp_compute_input)
         self._last_ffn_num_chunks = num_chunks
-
-        if not self._ffn_chunking_active_logged:
-            logger.info_once(
-                "[fused_moe] MoE FFN token chunking is active: comm_method=%s, "
-                "routed_tokens=%s, hidden_size=%s, intermediate_size=%s, "
-                "experts_per_token=%s, chunk_size=%s, num_chunks=%s.",
-                type(self).__name__,
-                hidden_states.shape[0],
-                hidden_states.shape[-1],
-                intermediate_size,
-                self.moe_config.experts_per_token,
-                self.ffn_chunk_size,
-                num_chunks,
-            )
-            self._ffn_chunking_active_logged = True
 
         return run_moe_ffn_in_token_chunks(
             mlp_compute_input,
@@ -478,18 +503,10 @@ class AlltoAllCommImpl(MoECommMethod):
             return super().fused_experts(fused_experts_input)
 
         self._last_ffn_num_chunks = num_chunks
-        if not getattr(self, "_ffn_chunking_active_logged", False):
-            logger.info_once(
-                "[fused_moe] MoE end-to-end FFN token chunking is active: comm_method=%s, "
-                "num_tokens=%s, hidden_size=%s, chunk_size=%s, num_chunks=%s. "
-                "dispatch/MLP/combine all run per chunk.",
-                type(self).__name__,
-                num_tokens,
-                fused_experts_input.hidden_states.shape[-1],
-                self.ffn_chunk_size,
-                num_chunks,
-            )
-            self._ffn_chunking_active_logged = True
+        if _FFN_CHUNK_LOG:
+            # num_tokens here is the pre-dispatch count (uniform per TP group,
+            # may differ across DP engines)
+            _log_ffn_chunk_stats("e2e", self.ffn_chunk_size, num_tokens, num_chunks)
 
         should_debug_memory = (
             self.ffn_chunk_memory_debug

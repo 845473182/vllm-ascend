@@ -23,6 +23,8 @@ vllm_ascend.ops.fused_moe.fused_moe only.
 
 from __future__ import annotations
 
+import os
+
 from vllm_ascend.ops.fused_moe.fused_moe import (
     _EXTRA_CTX,
     AllGatherCommImpl,
@@ -432,7 +434,13 @@ class AscendFusedMoE(FusedMoE):
         # Load balancing for token distribution among experts in dummy_run
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
-        enable_force_load_balance = _EXTRA_CTX.in_profile_run
+        # Default: profile runs only (balanced shapes, real routing at
+        # runtime). VLLM_ASCEND_FORCE_LOAD_BALANCE=1 forces it on for real
+        # requests too — randomizes routing, outputs become garbage; use
+        # only for memory/perf experiments.
+        enable_force_load_balance = _EXTRA_CTX.in_profile_run or os.environ.get(
+            "VLLM_ASCEND_FORCE_LOAD_BALANCE"
+        ) == "1"
 
         forward_context = get_forward_context()
         if self.multistream_overlap_gate:

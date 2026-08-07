@@ -486,39 +486,88 @@ def _saving(off_value: int, on_value: int) -> tuple[int, float | None]:
 
 
 def build_comparisons(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    grouped: dict[tuple[int, int], dict[str, list[dict[str, Any]]]] = defaultdict(
+    """Pair OFF/ON snapshots and build one comparison row per pair.
+
+    Pairing is two-pass:
+      1. Exact: same rank AND same token count. Works when both runs stamped
+         the snapshot name with the same token scope.
+      2. By rank: leftovers are paired within the same rank. Needed when one
+         run measured at the fused_experts (pre-dispatch) scope and the other
+         at the apply_mlp (post-dispatch routed) scope — token counts then
+         never match even though both captured the same MoE forward.
+    """
+
+    def newest(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return max(
+            items,
+            key=lambda report: (
+                report["metadata"]["timestamp_ns"] or 0,
+                Path(report["path"]).stat().st_mtime_ns,
+            ),
+        )
+
+    def by_timestamp(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(items, key=lambda report: (report["metadata"]["timestamp_ns"] or 0, report["path"]))
+
+    warnings = []
+    pairs: list[tuple[int, dict[str, Any], dict[str, Any], bool]] = []
+    used_paths: set[str] = set()
+
+    exact_groups: dict[tuple[int, int], dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: {"off": [], "on": []}
     )
-    warnings = []
     for report in reports:
         metadata = report["metadata"]
         state = metadata["state"]
         rank = metadata["rank"]
         tokens = metadata["routed_tokens"]
         if state in {"off", "on"} and rank is not None and tokens is not None:
-            grouped[(rank, tokens)][state].append(report)
+            exact_groups[(rank, tokens)][state].append(report)
 
-    comparisons = []
-    for (rank, tokens), states in sorted(grouped.items()):
+    for (rank, tokens), states in sorted(exact_groups.items()):
         if not states["off"] or not states["on"]:
-            warnings.append(f"rank={rank}, routed_tokens={tokens}: missing chunk OFF or ON snapshot")
             continue
-
-        def newest(items: list[dict[str, Any]]) -> dict[str, Any]:
-            return max(
-                items,
-                key=lambda report: (
-                    report["metadata"]["timestamp_ns"] or 0,
-                    Path(report["path"]).stat().st_mtime_ns,
-                ),
-            )
-
-        off_report = newest(states["off"])
-        on_report = newest(states["on"])
         if len(states["off"]) > 1 or len(states["on"]) > 1:
             warnings.append(
-                f"rank={rank}, routed_tokens={tokens}: multiple snapshots found; newest OFF and ON files were used"
+                f"rank={rank}, tokens={tokens}: multiple snapshots found; newest OFF and ON files were used"
             )
+        pairs.append((rank, newest(states["off"]), newest(states["on"]), True))
+        used_paths.update(report["path"] for report in states["off"] + states["on"])
+
+    rank_groups: dict[int, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: {"off": [], "on": []})
+    for report in reports:
+        metadata = report["metadata"]
+        state = metadata["state"]
+        rank = metadata["rank"]
+        if state in {"off", "on"} and rank is not None and report["path"] not in used_paths:
+            rank_groups[rank][state].append(report)
+
+    for rank, states in sorted(rank_groups.items()):
+        offs = by_timestamp(states["off"])
+        ons = by_timestamp(states["on"])
+        for off_report, on_report in zip(offs, ons):
+            off_tokens = off_report["metadata"]["routed_tokens"]
+            on_tokens = on_report["metadata"]["routed_tokens"]
+            warnings.append(
+                f"rank={rank}: no token-identical counterpart; paired by rank only "
+                f"(OFF tokens={off_tokens}, ON tokens={on_tokens}). The token scopes differ "
+                "(post-dispatch routed vs pre-dispatch); this is only meaningful if both "
+                "runs replayed the same batch."
+            )
+            pairs.append((rank, off_report, on_report, False))
+        for report in offs[len(ons):]:
+            warnings.append(
+                f"rank={rank}, tokens={report['metadata']['routed_tokens']}: missing chunk ON snapshot"
+            )
+        for report in ons[len(offs):]:
+            warnings.append(
+                f"rank={rank}, tokens={report['metadata']['routed_tokens']}: missing chunk OFF snapshot"
+            )
+
+    comparisons = []
+    for rank, off_report, on_report, token_match in sorted(
+        pairs, key=lambda pair: (pair[0], pair[1]["metadata"]["routed_tokens"] or 0)
+    ):
         off_device = _primary_device_report(off_report)
         on_device = _primary_device_report(on_report)
         off_allocated = off_device["allocated_timeline"]
@@ -538,7 +587,9 @@ def build_comparisons(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any
         comparisons.append(
             {
                 "rank": rank,
-                "routed_tokens": tokens,
+                "off_tokens": off_report["metadata"]["routed_tokens"],
+                "on_tokens": on_report["metadata"]["routed_tokens"],
+                "token_match": token_match,
                 "off_chunks": off_report["metadata"]["chunks"],
                 "on_chunks": on_report["metadata"]["chunks"],
                 "off_path": off_report["path"],
@@ -665,10 +716,20 @@ def print_comparisons(
     print("\n" + "#" * 100)
     print("FFN CHUNK OFF/ON COMPARISON")
     if not comparisons:
-        print("No exact OFF/ON pair was found. File names must have the same rank and routed_tokens.")
-    for row in comparisons:
         print(
-            f"rank={row['rank']}, routed_tokens={row['routed_tokens']}, "
+            "No OFF/ON pair was found, even pairing by rank only. "
+            "File names must at least share the same rank."
+        )
+    for row in comparisons:
+        if row["token_match"]:
+            token_text = f"tokens={row['off_tokens']}"
+        else:
+            token_text = (
+                f"tokens(off)={row['off_tokens']}, tokens(on)={row['on_tokens']} "
+                "[paired by rank; token scopes differ]"
+            )
+        print(
+            f"rank={row['rank']}, {token_text}, "
             f"chunks={row['off_chunks']}->{row['on_chunks']}"
         )
         print(

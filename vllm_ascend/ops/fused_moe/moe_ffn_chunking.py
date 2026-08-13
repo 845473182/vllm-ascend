@@ -15,67 +15,12 @@
 
 """Token chunking helpers for the routed MoE FFN stage."""
 
-import math
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 
 import torch
 
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
-
-
-def estimate_ffn_num_chunks(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    *,
-    live_factor: float = 3.0,
-    target_hidden_factor: float = 2.0,
-    min_chunk_size: int = 1024,
-) -> int:
-    """Return a shape-aware chunk count with a minimum chunk-size guard."""
-    if num_tokens < 0:
-        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
-    if hidden_size <= 0:
-        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
-    if intermediate_size <= 0:
-        raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
-    if not math.isfinite(live_factor) or live_factor <= 0:
-        raise ValueError(f"live_factor must be finite and positive, got {live_factor}")
-    if not math.isfinite(target_hidden_factor) or target_hidden_factor <= 0:
-        raise ValueError(f"target_hidden_factor must be finite and positive, got {target_hidden_factor}")
-    if min_chunk_size <= 0:
-        raise ValueError(f"min_chunk_size must be positive, got {min_chunk_size}")
-
-    shape_num_chunks = max(
-        1,
-        math.ceil(live_factor * intermediate_size / (target_hidden_factor * hidden_size)),
-    )
-    max_chunks_for_tokens = max(1, num_tokens // min_chunk_size)
-    return min(shape_num_chunks, max_chunks_for_tokens)
-
-
-def estimate_moe_ffn_num_chunks(
-    num_routed_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-    experts_per_token: int,
-    *,
-    live_factor: float = 3.0,
-    target_hidden_factor: float = 2.0,
-    min_chunk_size: int = 1024,
-) -> int:
-    """Adapt the shape heuristic to top-k-expanded routed expert rows."""
-    if experts_per_token <= 0:
-        raise ValueError(f"experts_per_token must be positive, got {experts_per_token}")
-    return estimate_ffn_num_chunks(
-        num_tokens=num_routed_tokens,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size * experts_per_token,
-        live_factor=live_factor,
-        target_hidden_factor=target_hidden_factor,
-        min_chunk_size=min_chunk_size,
-    )
 
 
 def balanced_chunk_ranges(num_tokens: int, num_chunks: int) -> Iterator[tuple[int, int]]:
@@ -206,36 +151,11 @@ def run_moe_ffn_in_token_chunks(
         assert chunk_size is not None
         ranges = fixed_chunk_ranges(num_tokens, chunk_size)
 
-    ranges_list = list(ranges)
     before_gmm2_event: object | None = None
     output: torch.Tensor | None = None
-    # ``read_source`` is the tensor we slice per-iteration to build
-    # ``chunk_input.hidden_states``. It starts as the caller's dispatch
-    # buffer. On the quantized-dispatch fallback we point it at ``output``
-    # AFTER we have (a) allocated ``output`` sized to the true MLP result
-    # dtype AND (b) already consumed / copied every earlier chunk's data
-    # into ``output``. Since output is written in the same slice ordering
-    # we then read from, chunks 2..K only read data they have themselves
-    # just written — but we never actually re-read past chunks because the
-    # loop always advances ``start``. The critical property is: once we
-    # dispose the input, subsequent iterations must not slice the disposed
-    # tensor; ``read_source`` gives us a valid buffer to slice, even though
-    # its dtype/shape happen to be the output's — which is fine because
-    # the quantized path re-consumes chunk data via ``apply_mlp`` from
-    # ``chunk_input.hidden_states``, and each chunk's ``hidden_states`` is
-    # already fully materialised by then.
-    #
-    # ⚠ This is subtle: for the fallback path, we MUST slice from the
-    # original input tensor for every chunk. So we cannot dispose after
-    # only one chunk. Instead we dispose AFTER the loop ends — trading off
-    # some peak reduction for correctness. If a caller wants the maximum
-    # peak reduction on the quantized path, dispatch should return BF16
-    # (making the same_layout fast path apply) or the caller should chunk
-    # dispatch itself.
-    read_source = hidden_states
 
-    for idx, (start, end) in enumerate(ranges_list):
-        chunk_view = read_source[start:end]
+    for start, end in ranges:
+        chunk_view = hidden_states[start:end]
         chunk_input = replace(
             mlp_compute_input,
             hidden_states=chunk_view,
@@ -265,7 +185,8 @@ def run_moe_ffn_in_token_chunks(
             else:
                 # Quantized-dispatch fallback: input dtype (e.g. int8)
                 # differs from output dtype (e.g. bfloat16). Allocate a new
-                # output buffer. See note above about deferred dispose.
+                # output buffer and keep the input alive until every chunk has
+                # consumed its source slice.
                 output = chunk_output.new_empty((num_tokens, *chunk_output.shape[1:]))
         output[start:end].copy_(chunk_output)
         del chunk_output

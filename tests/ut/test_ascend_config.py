@@ -182,7 +182,6 @@ class TestAscendConfig(TestBase):
             ({"ffn_chunk_size": True}, "must be an integer"),
             ({"ffn_chunk_size": 1.5}, "must be an integer"),
             ({"ffn_chunk_size": 0}, "must be positive"),
-            ({"ffn_min_chunk_size": 1024}, "no longer supported"),
         ]
 
         for additional_config, error_pattern in invalid_configs:

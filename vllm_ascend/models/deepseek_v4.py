@@ -24,7 +24,6 @@
 # limitations under the License.
 #
 import math
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -44,7 +43,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -910,37 +908,6 @@ class DeepseekV4Attention(nn.Module):
         return self.dsa_attn(positions, hidden_states, llama_4_scaling)
 
 
-_ACT_PEAK_ON = os.environ.get("VLLM_DS4_ACT_PEAK") == "1"
-# Optional comma-separated layer filter; empty means all layers.
-_ACT_PEAK_LAYERS = {
-    int(item) for item in os.environ.get("VLLM_DS4_ACT_PEAK_LAYERS", "").split(",") if item.strip()
-}
-
-
-def _measure_act_peak(layer_idx: int, module: str, fn):
-    """Run fn() and log its allocated-bytes peak growth (MiB).
-
-    Enabled with VLLM_DS4_ACT_PEAK=1; VLLM_DS4_ACT_PEAK_LAYERS="5,6" limits
-    logging to specific layers. The synchronizes bracket the call so async
-    allocs/frees from neighboring modules cannot leak into this measurement.
-    """
-    torch.npu.synchronize()
-    torch.npu.reset_peak_memory_stats()
-    before = int(torch.npu.memory_allocated())
-    out = fn()
-    torch.npu.synchronize()
-    increase = max(0, int(torch.npu.max_memory_allocated()) - before)
-    if not _ACT_PEAK_LAYERS or layer_idx in _ACT_PEAK_LAYERS:
-        logger.warning(
-            "[ACT_PEAK] layer=%d module=%s before=%.1f MiB increase=%.1f MiB",
-            layer_idx,
-            module,
-            before / 2**20,
-            increase / 2**20,
-        )
-    return out
-
-
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1023,18 +990,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        if _ACT_PEAK_ON:
-            hidden_states = _measure_act_peak(self.layer_idx, "attention", lambda: self.self_attn(**attn_kwargs))
-        else:
-            hidden_states = self.self_attn(**attn_kwargs)
+        hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if _ACT_PEAK_ON:
-            hidden_states = _measure_act_peak(self.layer_idx, "moe", lambda: self.mlp(hidden_states))
-        else:
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1115,18 +1076,14 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
-        # Pre-hc_head residual stream buffer for the MTP draft. Only needed
-        # when speculative decoding is enabled; allocating it unconditionally
-        # would permanently cost max_num_batched_tokens * hc_dim per rank.
-        self._mtp_hidden_buffer = (
-            torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                hc_dim,
-                dtype=vllm_config.model_config.dtype,
-                device=self.device,
-            )
-            if vllm_config.speculative_config is not None
-            else None
+        # Pre-hc_head residual stream buffer for the MTP draft. Stable
+        # address (outside the cudagraph pool) so the copy_ in forward()
+        # refreshes it correctly across captured shapes.
+        self._mtp_hidden_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            hc_dim,
+            dtype=vllm_config.model_config.dtype,
+            device=self.device,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1177,28 +1134,25 @@ class DeepseekV4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        # Skipped entirely when speculative decoding is disabled: the buffer
-        # is None and the all_gather below would be pure overhead. When
-        # FlashComm1 (sequence parallelism) is enabled, tokens are
+        # When FlashComm1 (sequence parallelism) is enabled, tokens are
         # partitioned across TP ranks via reduce_scatter in each layer's
         # row-parallel output projection.  We must all_gather here so the
         # MTP layers receive the full token set — otherwise only rank 0's
         # partition is valid and the rest of the buffer holds stale data,
         # leading to NaN values and low acceptance rate.
-        if self._mtp_hidden_buffer is not None:
-            from vllm_ascend.ascend_forward_context import get_forward_context
+        from vllm_ascend.ascend_forward_context import get_forward_context
 
-            forward_ctx = get_forward_context()
-            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-                h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
-                pad_size = forward_ctx.pad_size
-                if pad_size > 0:
-                    h_states_flat = h_states_flat[:-pad_size]
-                num_tokens = h_states_flat.shape[0]
-                self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
-            else:
-                num_tokens = hidden_states.shape[0]
-                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        forward_ctx = get_forward_context()
+        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+            h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
+            pad_size = forward_ctx.pad_size
+            if pad_size > 0:
+                h_states_flat = h_states_flat[:-pad_size]
+            num_tokens = h_states_flat.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+        else:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

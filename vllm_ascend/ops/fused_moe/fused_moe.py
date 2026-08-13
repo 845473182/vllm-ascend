@@ -576,8 +576,7 @@ else:
             # Load balancing for token distribution among experts in dummy_run
             # TODO: The community only considers load balancing when DP > 1.
             # This approach may overlook some extreme scenarios.
-            # enable_force_load_balance = _EXTRA_CTX.in_profile_run
-            enable_force_load_balance = True
+            enable_force_load_balance = _EXTRA_CTX.in_profile_run
             forward_context = get_forward_context()
             if self.multistream_overlap_gate:
                 fc3_context = get_flash_common3_context()

@@ -19,7 +19,6 @@
 
 import logging
 import math
-import os
 import sys
 import time
 from collections import defaultdict
@@ -28,7 +27,6 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
@@ -3817,48 +3815,8 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
-        if os.environ.get("VLLM_NPU_PROFILE_MEM_SNAPSHOT_DIR"):
-            self._profile_run_with_mem_snapshot()
-        else:
-            super().profile_run()
+        super().profile_run()
         self.max_num_tokens = origin_max_num_tokens
-
-    def _profile_run_with_mem_snapshot(self) -> None:
-        """profile_run wrapped in an allocator-history capture.
-
-        Enabled by setting VLLM_NPU_PROFILE_MEM_SNAPSHOT_DIR. Records every
-        allocation (with Python stacks) around the whole profile forward and
-        dumps one torch_npu memory snapshot per rank, so the activation peak
-        can be attributed (MoE vs attention) from the recorded call sites.
-        """
-        snapshot_dir = os.environ["VLLM_NPU_PROFILE_MEM_SNAPSHOT_DIR"]
-        max_entries = int(os.environ.get("VLLM_NPU_PROFILE_MEM_SNAPSHOT_MAX_ENTRIES", "1000000"))
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        torch.npu.memory._record_memory_history(
-            enabled="all", context="all", stacks="python", max_entries=max_entries
-        )
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        allocated_before = int(torch.npu.memory_allocated())
-        try:
-            super().profile_run()
-            torch.npu.synchronize()
-            peak_allocated = int(torch.npu.max_memory_allocated())
-            snapshot_path = Path(snapshot_dir) / f"profile_run_rank{rank}_tokens{self.max_num_tokens}.pickle"
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.npu.memory._dump_snapshot(str(snapshot_path))
-            logger.warning(
-                "[PROFILE_MEMORY] rank=%s num_tokens=%s allocated_before=%.1f MiB "
-                "peak_allocated=%.1f MiB peak_increase=%.1f MiB snapshot=%s",
-                rank,
-                self.max_num_tokens,
-                allocated_before / 2**20,
-                peak_allocated / 2**20,
-                max(0, peak_allocated - allocated_before) / 2**20,
-                snapshot_path,
-            )
-        finally:
-            torch.npu.memory._record_memory_history(enabled=None)
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:

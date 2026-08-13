@@ -7,8 +7,6 @@ import torch
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
     balanced_chunk_ranges,
     chunk_group_list,
-    estimate_ffn_num_chunks,
-    estimate_moe_ffn_num_chunks,
     fixed_chunk_ranges,
     run_moe_ffn_in_token_chunks,
     supports_moe_ffn_chunking,
@@ -18,50 +16,6 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEQuantParams,
     MoEWeights,
 )
-
-
-def _estimate(num_tokens: int, **overrides: int | float) -> int:
-    values: dict[str, int | float] = {
-        "num_tokens": num_tokens,
-        "hidden_size": 4096,
-        "intermediate_size": 11008,
-        "live_factor": 3.0,
-        "target_hidden_factor": 2.0,
-        "min_chunk_size": 1024,
-    }
-    values.update(overrides)
-    return estimate_ffn_num_chunks(**values)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_chunks"),
-    [
-        (256, 1),
-        (1024, 1),
-        (2048, 2),
-        (3072, 3),
-        (4096, 4),
-        (4097, 4),
-        (8192, 5),
-        (16384, 5),
-    ],
-)
-def test_estimate_ffn_num_chunks(num_tokens: int, expected_chunks: int) -> None:
-    assert _estimate(num_tokens) == expected_chunks
-
-
-def test_min_chunk_size_can_limit_shape_target_to_one() -> None:
-    assert _estimate(2047, hidden_size=1024, intermediate_size=8192, min_chunk_size=2048) == 1
-
-
-def test_moe_shape_estimate_accounts_for_topk_expansion() -> None:
-    assert estimate_moe_ffn_num_chunks(
-        num_routed_tokens=8192,
-        hidden_size=7168,
-        intermediate_size=2048,
-        experts_per_token=8,
-        min_chunk_size=1024,
-    ) == 4
 
 
 @pytest.mark.parametrize(

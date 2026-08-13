@@ -1076,14 +1076,18 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
-        # Pre-hc_head residual stream buffer for the MTP draft. Stable
-        # address (outside the cudagraph pool) so the copy_ in forward()
-        # refreshes it correctly across captured shapes.
-        self._mtp_hidden_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            hc_dim,
-            dtype=vllm_config.model_config.dtype,
-            device=self.device,
+        # Pre-hc_head residual stream buffer for the MTP draft. Only needed
+        # when speculative decoding is enabled; allocating it unconditionally
+        # would permanently cost max_num_batched_tokens * hc_dim per rank.
+        self._mtp_hidden_buffer = (
+            torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                hc_dim,
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            if vllm_config.speculative_config is not None
+            else None
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1134,25 +1138,28 @@ class DeepseekV4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        # When FlashComm1 (sequence parallelism) is enabled, tokens are
+        # Skipped entirely when speculative decoding is disabled: the buffer
+        # is None and the all_gather below would be pure overhead. When
+        # FlashComm1 (sequence parallelism) is enabled, tokens are
         # partitioned across TP ranks via reduce_scatter in each layer's
         # row-parallel output projection.  We must all_gather here so the
         # MTP layers receive the full token set — otherwise only rank 0's
         # partition is valid and the rest of the buffer holds stale data,
         # leading to NaN values and low acceptance rate.
-        from vllm_ascend.ascend_forward_context import get_forward_context
+        if self._mtp_hidden_buffer is not None:
+            from vllm_ascend.ascend_forward_context import get_forward_context
 
-        forward_ctx = get_forward_context()
-        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-            h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
-            pad_size = forward_ctx.pad_size
-            if pad_size > 0:
-                h_states_flat = h_states_flat[:-pad_size]
-            num_tokens = h_states_flat.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
-        else:
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            forward_ctx = get_forward_context()
+            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+                h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
+                pad_size = forward_ctx.pad_size
+                if pad_size > 0:
+                    h_states_flat = h_states_flat[:-pad_size]
+                num_tokens = h_states_flat.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+            else:
+                num_tokens = hidden_states.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

@@ -15,15 +15,11 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from time import time_ns
 
 import torch
-from vllm.distributed import get_dp_group, get_ep_group
+from vllm.distributed import get_dp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -58,39 +54,6 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
-
-# Per-call aggregated FFN-chunk logging (one line per chunking event,
-# printed on EP rank 0). Set VLLM_FFN_CHUNK_LOG=0 to silence.
-_FFN_CHUNK_LOG = os.environ.get("VLLM_FFN_CHUNK_LOG", "1") == "1"
-
-
-def _log_ffn_chunk_stats(scope: str, chunk_size: int, num_tokens: int, num_chunks: int) -> None:
-    """All-gather (tokens, chunks) across the EP group and log a single line.
-
-    tokens is the pre-dispatch count for the e2e scope and the post-dispatch
-    routed count for the inner-mlp scope. Every EP rank MUST call this on
-    every fused_experts invocation (the inner-mlp per-rank chunk count varies
-    with routing skew; a conditional call deadlocks the collective). The line
-    is printed on EP rank 0 only when at least one rank actually chunked.
-    """
-    ep_group = get_ep_group()
-    payload = torch.tensor([num_tokens, num_chunks], dtype=torch.int64)
-    gathered = [torch.empty_like(payload) for _ in range(ep_group.world_size)]
-    torch.distributed.all_gather(gathered, payload, group=ep_group.cpu_group)
-    if ep_group.rank_in_group != 0:
-        return
-    tokens = [int(item[0].item()) for item in gathered]
-    chunks = [int(item[1].item()) for item in gathered]
-    if max(chunks) <= 1:
-        return
-    logger.info(
-        "[fused_moe] %s FFN chunking: chunk_size=%s, tokens_per_rank=%s, chunks_per_rank=%s",
-        scope,
-        chunk_size,
-        tokens,
-        chunks,
-    )
-_MIB = 1024**2
 
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
@@ -173,17 +136,7 @@ class MoECommMethod(ABC):
 
         ascend_config = get_ascend_config()
         self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
-        self.ffn_chunk_memory_debug = getattr(ascend_config, "ffn_chunk_memory_debug", False) is True
-        self.ffn_chunk_memory_snapshot_dir = getattr(ascend_config, "ffn_chunk_memory_snapshot_dir", None)
-        self.ffn_chunk_memory_snapshot_rank = getattr(ascend_config, "ffn_chunk_memory_snapshot_rank", 0)
-        self.ffn_chunk_memory_snapshot_max_entries = getattr(
-            ascend_config, "ffn_chunk_memory_snapshot_max_entries", 100000
-        )
         self.ffn_chunk_size = ascend_config.ffn_chunk_size
-        self._ffn_chunk_memory_debug_logged = False
-        self._last_ffn_num_chunks = 1
-        if self.enable_ffn_chunking:
-            self._ffn_chunking_active_logged = False
 
     def prepare(
         self,
@@ -245,17 +198,7 @@ class MoECommMethod(ABC):
         )
 
         apply_mlp = self._apply_mlp_with_optional_chunking if self.enable_ffn_chunking else self._apply_mlp
-        should_debug_memory = (
-            self.ffn_chunk_memory_debug
-            and not self._ffn_chunk_memory_debug_logged
-            and not getattr(_EXTRA_CTX, "in_profile_run", False)
-            and self._estimate_ffn_num_chunks(mlp_compute_input) > 1
-        )
-        # print(f"should_debug_memory={should_debug_memory}")
-        if should_debug_memory:
-            mlp_output, before_gmm2_evt = self._apply_mlp_with_memory_debug(mlp_compute_input, apply_mlp)
-        else:
-            mlp_output, before_gmm2_evt = apply_mlp(mlp_compute_input)
+        mlp_output, before_gmm2_evt = apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
@@ -282,112 +225,14 @@ class MoECommMethod(ABC):
         num_tokens = mlp_compute_input.hidden_states.shape[0]
         return max(1, (num_tokens + self.ffn_chunk_size - 1) // self.ffn_chunk_size)
 
-    def _apply_mlp_with_memory_debug(
-        self,
-        mlp_compute_input: MoEMlpComputeInput,
-        apply_mlp: Callable[[MoEMlpComputeInput], tuple[torch.Tensor, object | None]],
-    ) -> tuple[torch.Tensor, object | None]:
-        """Log the peak allocated memory of one chunk-eligible Routed Expert FFN."""
-        # Quantized MLP implementations may call dispose_tensor() on the
-        # original input, which mutates its shape to [0]. Preserve the routed
-        # token count before apply_mlp() so OFF-path logs and snapshot names do
-        # not observe the disposed tensor.
-        num_tokens = int(mlp_compute_input.hidden_states.shape[0])
-        return self._run_with_memory_debug(num_tokens, lambda: apply_mlp(mlp_compute_input))
-
-    def _run_with_memory_debug(self, num_tokens: int, run: Callable[[], object]):
-        """Measure the peak allocated memory of one MoE FFN invocation.
-
-        ``run`` is executed between two NPU synchronizations with peak-memory
-        stats reset, and an optional allocator-history snapshot is dumped
-        around it. ``num_tokens`` is taken before ``run`` because quantized
-        MLP implementations may dispose input tensors in place.
-        """
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 0
-        )
-        should_dump_snapshot = self.ffn_chunk_memory_snapshot_dir is not None and (
-            self.ffn_chunk_memory_snapshot_rank == -1 or self.ffn_chunk_memory_snapshot_rank == rank
-        )
-        history_started = False
-        if should_dump_snapshot:
-            try:
-                torch.npu.memory._record_memory_history(
-                    enabled="all",
-                    context="all",
-                    stacks="python",
-                    max_entries=self.ffn_chunk_memory_snapshot_max_entries,
-                )
-                history_started = True
-            except Exception:
-                logger.exception("[MOE_MEMORY] failed to start allocator history; continuing without a snapshot.")
-
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        allocated_before = int(torch.npu.memory_allocated())
-
-        try:
-            result = run()
-            torch.npu.synchronize()
-            peak_allocated = int(torch.npu.max_memory_allocated())
-
-            if history_started:
-                try:
-                    snapshot_dir = Path(self.ffn_chunk_memory_snapshot_dir)
-                    snapshot_dir.mkdir(parents=True, exist_ok=True)
-                    chunk_state = "on" if self.enable_ffn_chunking else "off"
-                    snapshot_path = snapshot_dir / (
-                        f"moe_ffn_chunk_{chunk_state}_rank{rank}_tokens{num_tokens}_"
-                        f"chunks{self._last_ffn_num_chunks}_{time_ns()}.pickle"
-                    )
-                    torch.npu.memory._dump_snapshot(str(snapshot_path))
-                    logger.warning("[MOE_MEMORY] allocator snapshot saved: %s", snapshot_path)
-                except Exception:
-                    logger.exception("[MOE_MEMORY] failed to save the allocator snapshot.")
-        finally:
-            if history_started:
-                try:
-                    torch.npu.memory._record_memory_history(enabled=None)
-                except Exception:
-                    logger.exception("[MOE_MEMORY] failed to stop allocator history.")
-
-        peak_growth = max(0, peak_allocated - allocated_before)
-        logger.warning(
-            "[MOE_MEMORY] rank=%s ffn_chunk=%s routed_tokens=%s num_chunks=%s "
-            "moe_peak_allocated=%.3f MiB moe_peak_increase=%.3f MiB",
-            rank,
-            "ON" if self.enable_ffn_chunking else "OFF",
-            num_tokens,
-            self._last_ffn_num_chunks,
-            peak_allocated / _MIB,
-            peak_growth / _MIB,
-        )
-        self._ffn_chunk_memory_debug_logged = True
-        return result
-
     def _apply_mlp_with_optional_chunking(
         self,
         mlp_compute_input: MoEMlpComputeInput,
     ) -> tuple[torch.Tensor, object | None]:
         """Chunk only the local routed expert MLP, never dispatch/combine."""
-        self._last_ffn_num_chunks = 1
-        hidden_states = mlp_compute_input.hidden_states
-        intermediate_size = getattr(self.moe_config, "intermediate_size_per_partition", -1)
-        if intermediate_size <= 0:
-            intermediate_size = self.moe_config.intermediate_size
         num_chunks = self._estimate_ffn_num_chunks(mlp_compute_input)
-        if _FFN_CHUNK_LOG:
-            # Gather unconditionally on every rank BEFORE the early return
-            # below: the per-rank chunk count varies with routing skew, so a
-            # conditional all_gather would deadlock the EP group. The helper
-            # prints only when some rank actually chunked.
-            # num_tokens here is the post-dispatch routed count (varies per rank)
-            _log_ffn_chunk_stats("inner-mlp", self.ffn_chunk_size, hidden_states.shape[0], num_chunks)
         if num_chunks <= 1:
             return self._apply_mlp(mlp_compute_input)
-        self._last_ffn_num_chunks = num_chunks
 
         return run_moe_ffn_in_token_chunks(
             mlp_compute_input,
@@ -484,39 +329,7 @@ class AlltoAllCommImpl(MoECommMethod):
         num_tokens = fused_experts_input.hidden_states.shape[0]
         num_chunks = self._e2e_chunk_count(num_tokens)
         if num_chunks == 0:
-            should_debug_memory = (
-                self.ffn_chunk_memory_debug
-                and not self._ffn_chunk_memory_debug_logged
-                and not getattr(_EXTRA_CTX, "in_profile_run", False)
-            )
-            if should_debug_memory:
-                # Measure at the same fused_experts scope as the chunked path
-                # (whole dispatch/MLP/combine chain, pre-dispatch token count)
-                # so OFF/ON snapshots pair by (rank, num_tokens) in the
-                # analyzer. Suppress the base class's inner apply_mlp-level
-                # measurement to avoid a double capture.
-                self._ffn_chunk_memory_debug_logged = True
-                self._last_ffn_num_chunks = 1
-                return self._run_with_memory_debug(
-                    num_tokens, lambda: MoECommMethod.fused_experts(self, fused_experts_input)
-                )
             return super().fused_experts(fused_experts_input)
-
-        self._last_ffn_num_chunks = num_chunks
-        if _FFN_CHUNK_LOG:
-            # num_tokens here is the pre-dispatch count (uniform per TP group,
-            # may differ across DP engines)
-            _log_ffn_chunk_stats("e2e", self.ffn_chunk_size, num_tokens, num_chunks)
-
-        should_debug_memory = (
-            self.ffn_chunk_memory_debug
-            and not self._ffn_chunk_memory_debug_logged
-            and not getattr(_EXTRA_CTX, "in_profile_run", False)
-        )
-        if should_debug_memory:
-            return self._run_with_memory_debug(
-                num_tokens, lambda: self._fused_experts_chunked_e2e(fused_experts_input, num_chunks)
-            )
         return self._fused_experts_chunked_e2e(fused_experts_input, num_chunks)
 
     def _e2e_chunk_count(self, num_tokens: int) -> int:

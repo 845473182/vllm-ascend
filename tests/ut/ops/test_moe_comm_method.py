@@ -7,6 +7,7 @@ from tests.ut.base import TestBase
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
+    FusedMC2CommImpl,
     MC2CommImpl,
     MoECommMethod,
 )
@@ -20,7 +21,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEWeights,
     slice_fused_experts_input_along_tokens,
 )
-from vllm_ascend.ops.fused_moe.token_dispatcher import MoETokenDispatchOutput
+from vllm_ascend.ops.fused_moe.token_dispatcher import MoETokenDispatchOutput, TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.base import QuantType
 
 
@@ -371,6 +372,75 @@ class TestMoECommMethod(TestBase):
             ),
             quant=MoEQuantParams(),
         )
+
+    def _make_fused_mc2_impl(self, *, ep_world_size: int = 2) -> FusedMC2CommImpl:
+        # Construct the implementation without running its NPU-only __init__.
+        comm_impl = object.__new__(FusedMC2CommImpl)
+        comm_impl.moe_config = self.moe_config
+        comm_impl.enable_ffn_chunking = True
+        comm_impl.ffn_chunk_size = 4
+        comm_impl.expert_token_nums = torch.zeros(self.moe_config.num_local_experts, dtype=torch.int32)
+        token_dispatcher = object.__new__(TokenDispatcherWithMC2)
+        token_dispatcher.ep_world_size = ep_world_size
+        token_dispatcher.global_bs = 0
+        token_dispatcher.moe_all_to_all_group_name = "mock_mc2_group"
+        comm_impl.token_dispatcher = token_dispatcher
+        return comm_impl
+
+    def test_fused_mc2_chunk_max_output_size_tracks_chunk_capacity(self):
+        self.mock_ascend_config.enable_fused_mc2 = 1
+        self.mock_ascend_config.mega_moe_max_tokens = 100
+        comm_impl = self._make_fused_mc2_impl(ep_world_size=2)
+
+        # 4 source tokens/rank * EP2 * top-k2 = 16 routed rows in the
+        # worst case, so the per-chunk workspace can safely shrink to 16.
+        assert comm_impl._fused_mc2_chunk_max_output_size(num_chunks=3) == 16
+
+        # The user-configured cap remains the ceiling when it is lower than
+        # the conservative per-chunk bound.
+        self.mock_ascend_config.mega_moe_max_tokens = 12
+        assert comm_impl._fused_mc2_chunk_max_output_size(num_chunks=3) == 12
+
+        # Uneven-token mode uses the rank-invariant global capacity instead of
+        # assuming every locally balanced chunk is no larger than chunk_size.
+        comm_impl.token_dispatcher.global_bs = 40  # 20 source tokens/rank.
+        self.mock_ascend_config.mega_moe_max_tokens = 100
+        # ceil(20 / 2 chunks) * EP2 * top-k2 = 40.
+        assert comm_impl._fused_mc2_chunk_max_output_size(num_chunks=2) == 40
+
+    def test_fused_mc2_chunking_slices_inputs_reuses_output_and_accumulates_expert_tokens(self):
+        self.mock_ascend_config.enable_fused_mc2 = 1
+        self.mock_ascend_config.mega_moe_max_tokens = 100
+        comm_impl = self._make_fused_mc2_impl(ep_world_size=2)
+        hidden_states = torch.arange(72, dtype=torch.float32).reshape(9, 8)
+        fused_input = self._make_e2e_fused_input(hidden_states)
+        seen_sizes = []
+        seen_max_output_sizes = []
+        seen_masks = []
+
+        def fake_apply(chunk_input, *, out, max_output_size):
+            chunk_size = chunk_input.hidden_states.shape[0]
+            seen_sizes.append(chunk_size)
+            seen_max_output_sizes.append(max_output_size)
+            seen_masks.append(chunk_input.routing.mc2_mask.clone())
+            out.copy_(chunk_input.hidden_states * 2)
+            comm_impl.expert_token_nums.copy_(torch.tensor([chunk_size, chunk_size * 2], dtype=torch.int32))
+            return comm_impl.expert_token_nums
+
+        comm_impl._apply_dispatch_ffn_combine = fake_apply
+        result = comm_impl._fused_experts_chunked(fused_input, num_chunks=3)
+
+        assert seen_sizes == [3, 3, 3]
+        assert seen_max_output_sizes == [16, 16, 16]
+        assert all(mask.shape == (3,) for mask in seen_masks)
+        torch.testing.assert_close(result.routed_out, hidden_states * 2)
+        assert result.expert_tokens.tolist() == [9, 18]
+
+    def test_fused_mc2_chunking_bypasses_decode_fused_operator(self):
+        comm_impl = self._make_fused_mc2_impl()
+        self.mock_ascend_config.enable_fused_mc2 = 2
+
+        assert comm_impl._fused_mc2_chunk_count(num_tokens=16) == 0
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAll2All")

@@ -455,6 +455,117 @@ class FusedMC2CommImpl(MoECommMethod):
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithMC2(self.moe_config)
 
+    def _fused_mc2_chunk_count(self, num_tokens: int) -> int:
+        """Return a collective-safe chunk count for dispatch_ffn_combine."""
+        if not self.enable_ffn_chunking or get_ascend_config().enable_fused_mc2 != 1:
+            return 0
+        return _e2e_uniform_chunk_count(num_tokens, self.ffn_chunk_size, self.moe_config)
+
+    def _fused_mc2_chunk_max_output_size(self, num_chunks: int) -> int:
+        """Bound the per-chunk routed-token workspace without extra drops.
+
+        In uniform-token mode, each source rank contributes at most
+        ``ffn_chunk_size * top_k`` routed rows. In uneven-token mode,
+        ``TokenDispatcherWithMC2.global_bs`` provides the rank-invariant
+        maximum source-token capacity; divide that capacity across the agreed
+        chunk count instead. In the worst case all EP ranks route every row to
+        experts on one destination rank, so the expression below is a strict
+        upper bound for one chunk. Capping the configured capacity by that
+        bound can shrink dispatch_ffn_combine's dominant workspace while never
+        making overflow more likely than the unchunked configured path.
+
+        This value depends only on rank-invariant configuration. Every rank and
+        every chunk (including a shorter tail) therefore use identical
+        ``max_output_size`` values for the collective fused operator.
+        """
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        max_source_tokens_per_chunk = self.ffn_chunk_size
+        if self.token_dispatcher.global_bs > 0:
+            max_source_tokens_per_rank = (
+                self.token_dispatcher.global_bs + self.token_dispatcher.ep_world_size - 1
+            ) // self.token_dispatcher.ep_world_size
+            max_source_tokens_per_chunk = (
+                max_source_tokens_per_rank + num_chunks - 1
+            ) // num_chunks
+        worst_case_routed_tokens = (
+            max_source_tokens_per_chunk
+            * self.token_dispatcher.ep_world_size
+            * self.moe_config.experts_per_token
+        )
+        return min(get_ascend_config().mega_moe_max_tokens, worst_case_routed_tokens)
+
+    def _apply_dispatch_ffn_combine(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        *,
+        out: torch.Tensor,
+        max_output_size: int,
+    ) -> torch.Tensor:
+        """Apply one fused MC2 round and return this round's expert counts."""
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        assert self.expert_token_nums is not None
+        assert fused_experts_input.weights.w1_scale is not None
+        assert fused_experts_input.weights.w2_scale is not None
+        assert fused_experts_input.weights.w1_scale_bias is not None
+        assert fused_experts_input.weights.w2_scale_bias is not None
+
+        topk_ids = fused_experts_input.topk_ids
+        if fused_experts_input.routing.log2phy is not None:
+            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+
+        torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
+            x=fused_experts_input.hidden_states,
+            weight1=fused_experts_input.weights.w1,
+            weight2=fused_experts_input.weights.w2,
+            expert_idx=topk_ids,
+            scale1=fused_experts_input.weights.w1_scale,
+            scale2=fused_experts_input.weights.w2_scale,
+            bias1=fused_experts_input.weights.w1_scale_bias,
+            bias2=fused_experts_input.weights.w2_scale_bias,
+            probs=fused_experts_input.topk_weights.to(torch.float32),
+            group=self.token_dispatcher.moe_all_to_all_group_name,
+            max_output_size=max_output_size,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+            x_active_mask=fused_experts_input.routing.mc2_mask,
+            out=out,
+            expert_token_nums=self.expert_token_nums,
+        )
+        return self.expert_token_nums
+
+    def _fused_experts_chunked(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        num_chunks: int,
+    ) -> FusedExpertsResult:
+        """Run dispatch_ffn_combine once per raw-token chunk."""
+        assert self.expert_token_nums is not None
+        num_tokens = fused_experts_input.hidden_states.shape[0]
+        ranges = balanced_chunk_ranges(num_tokens, num_chunks)
+        max_output_size = self._fused_mc2_chunk_max_output_size(num_chunks)
+
+        # Use views into one full output allocation. This avoids keeping an
+        # additional per-chunk output alive while preserving original token
+        # order for prepare_finalize.finalize().
+        routed_out = torch.empty_like(fused_experts_input.hidden_states)
+        expert_tokens = torch.zeros_like(self.expert_token_nums)
+        for start, end in ranges:
+            chunk_input = slice_fused_experts_input_along_tokens(fused_experts_input, start, end)
+            chunk_expert_tokens = self._apply_dispatch_ffn_combine(
+                chunk_input,
+                out=routed_out[start:end],
+                max_output_size=max_output_size,
+            )
+            # dispatch_ffn_combine overwrites the reusable instance buffer on
+            # every call. Accumulate immediately on the same stream before the
+            # next chunk reuses it.
+            expert_tokens.add_(chunk_expert_tokens)
+
+        return FusedExpertsResult(
+            routed_out=routed_out,
+            expert_tokens=expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+        )
+
     def fused_experts(
         self,
         fused_experts_input: MoEFusedExpertsInput,
@@ -467,38 +578,29 @@ class FusedMC2CommImpl(MoECommMethod):
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
-        # Apply log2phy if needed
-        topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
-
         expert_tokens = None
         if get_ascend_config().enable_fused_mc2 == 1:
             assert not (
                 fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None
             ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
 
+            num_chunks = self._fused_mc2_chunk_count(fused_experts_input.hidden_states.shape[0])
+            if num_chunks > 0:
+                return self._fused_experts_chunked(fused_experts_input, num_chunks)
+
             out = torch.empty_like(fused_experts_input.hidden_states)
-            torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
-                x=fused_experts_input.hidden_states,
-                weight1=fused_experts_input.weights.w1,
-                weight2=fused_experts_input.weights.w2,
-                expert_idx=topk_ids,
-                scale1=fused_experts_input.weights.w1_scale,
-                scale2=fused_experts_input.weights.w2_scale,
-                bias1=fused_experts_input.weights.w1_scale_bias,
-                bias2=fused_experts_input.weights.w2_scale_bias,
-                probs=fused_experts_input.topk_weights.to(torch.float32),
-                group=self.token_dispatcher.moe_all_to_all_group_name,
-                max_output_size=get_ascend_config().mega_moe_max_tokens,
-                swiglu_limit=fused_experts_input.swiglu_limit,
-                x_active_mask=fused_experts_input.routing.mc2_mask,
+            expert_tokens = self._apply_dispatch_ffn_combine(
+                fused_experts_input,
                 out=out,
-                expert_token_nums=self.expert_token_nums,
+                max_output_size=get_ascend_config().mega_moe_max_tokens,
             )
-            expert_tokens = self.expert_token_nums
         elif get_ascend_config().enable_fused_mc2 == 2:
             assert fused_experts_input.routing.expert_map is not None, "expert_map cannot be None."
+            # Apply log2phy if needed. The enable_fused_mc2 == 1 path handles
+            # this inside _apply_dispatch_ffn_combine for every token chunk.
+            topk_ids = fused_experts_input.topk_ids
+            if fused_experts_input.routing.log2phy is not None:
+                topk_ids = fused_experts_input.routing.log2phy[topk_ids]
             out, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(  # type: ignore
                 x=fused_experts_input.hidden_states,
                 expert_ids=topk_ids,

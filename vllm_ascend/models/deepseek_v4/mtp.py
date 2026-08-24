@@ -22,6 +22,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.activation_memory import record_activation_peak
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV2DecoderLayer,
@@ -112,13 +113,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masking inputs at position 0, as not needed by MTP
-        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = previous_hidden_states.view(-1, self.hc_mult, self.config.hidden_size)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
+        num_tokens = previous_hidden_states.shape[0]
+        with record_activation_peak(
+            "mtp_input_fusion",
+            f"mtp.layer.{spec_step_index}.input_fusion",
+            layer_idx=spec_step_index,
+            num_tokens=num_tokens,
+        ):
+            # masking inputs at position 0, as not needed by MTP
+            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+            inputs_embeds = self.enorm(inputs_embeds)
+            previous_hidden_states = previous_hidden_states.view(-1, self.hc_mult, self.config.hidden_size)
+            previous_hidden_states = self.hnorm(previous_hidden_states)
 
-        hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
+            hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
 
         hidden_states, residual = self.mtp_block(
             positions=positions,
@@ -194,14 +202,24 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        mtp_layer = self.layers[str(current_step_idx)]
-        hidden_states = hidden_states.view(-1, mtp_layer.hc_mult, mtp_layer.config.hidden_size)
-        hidden_states = mtp_layer.hc_head(
-            hidden_states, mtp_layer.hc_head_fn, mtp_layer.hc_head_scale, mtp_layer.hc_head_base
-        )
-        logits = self.logits_processor(mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states))
-        return logits
+        num_tokens = hidden_states.shape[0]
+        with record_activation_peak(
+            "mtp_head",
+            f"mtp.layer.{spec_step_idx}.head",
+            layer_idx=spec_step_idx,
+            num_tokens=num_tokens,
+        ):
+            current_step_idx = spec_step_idx % self.num_mtp_layers
+            mtp_layer = self.layers[str(current_step_idx)]
+            hidden_states = hidden_states.view(-1, mtp_layer.hc_mult, mtp_layer.config.hidden_size)
+            hidden_states = mtp_layer.hc_head(
+                hidden_states,
+                mtp_layer.hc_head_fn,
+                mtp_layer.hc_head_scale,
+                mtp_layer.hc_head_base,
+            )
+            logits = self.logits_processor(mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states))
+            return logits
 
 
 @support_torch_compile

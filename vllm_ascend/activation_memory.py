@@ -289,3 +289,41 @@ def record_activation_buffer(category: str, label: str, size_bytes: int) -> None
     profiler = _ACTIVE_PROFILER.get()
     if profiler is not None:
         profiler.record_buffer(category, label, size_bytes)
+
+
+def log_ffn_chunk_decision(
+    *,
+    comm_method: str,
+    path: str,
+    enabled: bool,
+    raw_tokens: int,
+    dispatched_tokens: int | None,
+    chunk_size: int,
+    num_chunks: int,
+    applied: bool,
+    reason: str,
+) -> None:
+    """Log one MoE chunking decision inside an activation profile scope."""
+    profiler = _ACTIVE_PROFILER.get()
+    if profiler is None:
+        return
+
+    scope = profiler._scopes[-1] if profiler._scopes else None
+    logger.warning(
+        "[ACTIVATION_PEAK][FFN_CHUNK] rank=%s category=%s label=%s "
+        "layer=%s comm=%s path=%s enabled=%s raw_tokens=%s "
+        "dispatched_tokens=%s chunk_size=%s chunks=%s applied=%s reason=%s",
+        profiler.rank,
+        scope.category.upper() if scope is not None else "UNKNOWN",
+        scope.label if scope is not None else "-",
+        "-" if scope is None or scope.layer_idx is None else scope.layer_idx,
+        comm_method,
+        path,
+        enabled,
+        raw_tokens,
+        "-" if dispatched_tokens is None else dispatched_tokens,
+        chunk_size,
+        num_chunks,
+        applied,
+        reason,
+    )

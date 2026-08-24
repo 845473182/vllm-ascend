@@ -22,6 +22,7 @@ import torch
 from vllm.distributed import get_dp_group
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, log_ffn_chunk_decision
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.moe_ffn_chunking import (
@@ -137,6 +138,40 @@ class MoECommMethod(ABC):
         self.enable_ffn_chunking = getattr(ascend_config, "enable_ffn_chunking", False) is True
         self.ffn_chunk_size = ascend_config.ffn_chunk_size
 
+    def _log_chunk_decision(
+        self,
+        *,
+        path: str,
+        raw_tokens: int,
+        dispatched_tokens: int | None,
+        num_chunks: int,
+        supported: bool = True,
+        fallback_reason: str | None = None,
+    ) -> None:
+        applied = self.enable_ffn_chunking and supported and num_chunks > 1
+        if applied:
+            reason = "chunked"
+        elif not self.enable_ffn_chunking:
+            reason = "disabled"
+        elif not supported:
+            reason = "unsupported_payload"
+        elif fallback_reason is not None:
+            reason = fallback_reason
+        else:
+            reason = "token_count_le_chunk_size"
+
+        log_ffn_chunk_decision(
+            comm_method=type(self).__name__,
+            path=path,
+            enabled=self.enable_ffn_chunking,
+            raw_tokens=raw_tokens,
+            dispatched_tokens=dispatched_tokens,
+            chunk_size=self.ffn_chunk_size,
+            num_chunks=max(1, num_chunks),
+            applied=applied,
+            reason=reason,
+        )
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -195,6 +230,17 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             use_fusion_ops=self.use_fusion_ops,
         )
+
+        if is_activation_peak_profiling():
+            chunking_supported = supports_moe_ffn_chunking(mlp_compute_input)
+            num_chunks = self._estimate_ffn_num_chunks(mlp_compute_input) if self.enable_ffn_chunking else 1
+            self._log_chunk_decision(
+                path="MLP_ONLY_AFTER_DISPATCH",
+                raw_tokens=fused_experts_input.hidden_states.shape[0],
+                dispatched_tokens=mlp_compute_input.hidden_states.shape[0],
+                num_chunks=num_chunks,
+                supported=chunking_supported,
+            )
 
         apply_mlp = self._apply_mlp_with_optional_chunking if self.enable_ffn_chunking else self._apply_mlp
         mlp_output, before_gmm2_evt = apply_mlp(mlp_compute_input)
@@ -329,6 +375,12 @@ class AlltoAllCommImpl(MoECommMethod):
         num_chunks = self._e2e_chunk_count(num_tokens)
         if num_chunks == 0:
             return super().fused_experts(fused_experts_input)
+        self._log_chunk_decision(
+            path="E2E_DISPATCH_FFN_COMBINE",
+            raw_tokens=num_tokens,
+            dispatched_tokens=None,
+            num_chunks=num_chunks,
+        )
         return self._fused_experts_chunked_e2e(fused_experts_input, num_chunks)
 
     def _e2e_chunk_count(self, num_tokens: int) -> int:
@@ -584,9 +636,28 @@ class FusedMC2CommImpl(MoECommMethod):
                 fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None
             ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
 
-            num_chunks = self._fused_mc2_chunk_count(fused_experts_input.hidden_states.shape[0])
+            raw_tokens = fused_experts_input.hidden_states.shape[0]
+            num_chunks = self._fused_mc2_chunk_count(raw_tokens)
             if num_chunks > 0:
+                self._log_chunk_decision(
+                    path="E2E_DISPATCH_FFN_COMBINE",
+                    raw_tokens=raw_tokens,
+                    dispatched_tokens=None,
+                    num_chunks=num_chunks,
+                )
                 return self._fused_experts_chunked(fused_experts_input, num_chunks)
+
+            self._log_chunk_decision(
+                path="FUSED_SINGLE_PASS",
+                raw_tokens=raw_tokens,
+                dispatched_tokens=None,
+                num_chunks=1,
+                fallback_reason=(
+                    "token_count_le_chunk_size"
+                    if raw_tokens <= self.ffn_chunk_size
+                    else "collective_chunk_count_le_one"
+                ),
+            )
 
             out = torch.empty_like(fused_experts_input.hidden_states)
             expert_tokens = self._apply_dispatch_ffn_combine(
@@ -595,6 +666,13 @@ class FusedMC2CommImpl(MoECommMethod):
                 max_output_size=get_ascend_config().mega_moe_max_tokens,
             )
         elif get_ascend_config().enable_fused_mc2 == 2:
+            self._log_chunk_decision(
+                path="FUSED_DECODE_SINGLE_PASS",
+                raw_tokens=fused_experts_input.hidden_states.shape[0],
+                dispatched_tokens=None,
+                num_chunks=1,
+                fallback_reason="fused_mc2_mode_2_not_chunked",
+            )
             assert fused_experts_input.routing.expert_map is not None, "expert_map cannot be None."
             # Apply log2phy if needed. The enable_fused_mc2 == 1 path handles
             # this inside _apply_dispatch_ffn_combine for every token chunk.

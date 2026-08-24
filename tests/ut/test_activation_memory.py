@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
+    log_ffn_chunk_decision,
     record_activation_buffer,
     record_activation_peak,
 )
@@ -77,3 +78,52 @@ def test_disabled_activation_peak_session_is_noop():
     fake_npu.reset_peak_memory_stats.assert_not_called()
     fake_npu.max_memory_allocated.assert_not_called()
     fake_npu.memory_allocated.assert_not_called()
+
+
+def test_ffn_chunk_decision_uses_current_moe_scope():
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 110, 120, 120]),
+        memory_allocated=MagicMock(side_effect=[100, 100]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+        activation_peak_profile_session(enabled=True, rank=2),
+        record_activation_peak(
+            "mtp_moe",
+            "mtp.layer.61.moe",
+            layer_idx=61,
+            num_tokens=1500,
+        ),
+    ):
+        log_ffn_chunk_decision(
+            comm_method="FusedMC2CommImpl",
+            path="E2E_DISPATCH_FFN_COMBINE",
+            enabled=True,
+            raw_tokens=1500,
+            dispatched_tokens=None,
+            chunk_size=512,
+            num_chunks=3,
+            applied=True,
+            reason="chunked",
+        )
+
+    chunk_log = next(call for call in mock_warning.call_args_list if "[FFN_CHUNK]" in call.args[0])
+    assert chunk_log.args[1:] == (
+        2,
+        "MTP_MOE",
+        "mtp.layer.61.moe",
+        61,
+        "FusedMC2CommImpl",
+        "E2E_DISPATCH_FFN_COMBINE",
+        True,
+        1500,
+        "-",
+        512,
+        3,
+        True,
+        "chunked",
+    )

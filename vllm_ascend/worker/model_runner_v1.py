@@ -102,6 +102,12 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend.activation_memory import (
+    ActivationPeakProfiler,
+    activation_peak_profile_session,
+    record_activation_buffer,
+    record_activation_peak,
+)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -3739,41 +3745,55 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
+            with record_activation_peak(
+                "target_model",
+                "target.model_forward",
                 num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-                has_sinks = self._has_sinks,
-                input_ids=input_ids,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
-                )
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
-            else:
-                hidden_states = outputs
-            dummy_compute_logits(hidden_states)
-
-            if self.drafter and not profile_cpp:
-                self.drafter.dummy_run(
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
                     num_tokens=num_tokens_padded,
-                    with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
-                    dummy_compute_logits=dummy_drafter_compute_logits,
-                    in_graph_capturing=not force_attention,
-                    is_profile=is_profile,
-                )
+                    model_instance=self.model,
+                    has_sinks=self._has_sinks,
+                    input_ids=input_ids,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded,
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                    )
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
+                dummy_compute_logits(hidden_states)
+
+            if self.drafter and not profile_cpp:
+                with record_activation_peak(
+                    "mtp_draft",
+                    "mtp.draft_model",
+                    num_tokens=num_tokens_padded,
+                ):
+                    self.drafter.dummy_run(
+                        num_tokens=num_tokens_padded,
+                        with_prefill=with_prefill,
+                        num_reqs=num_reqs_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        aclgraph_runtime_mode=cudagraph_runtime_mode,
+                        batch_descriptor=batch_desc,
+                        dummy_compute_logits=dummy_drafter_compute_logits,
+                        in_graph_capturing=not force_attention,
+                        is_profile=is_profile,
+                    )
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()
             if not is_profile and self.dynamic_eplb:
@@ -3789,34 +3809,74 @@ class NPUModelRunner(GPUModelRunner):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        output = None
-
-        # For profile, have maximum num_reqs and that collectively have
-        # maximum num_tokens.
-        min_tokens_per_req = self.max_num_tokens // self.max_num_reqs
-        num_scheduled_tokens_list = [min_tokens_per_req] * self.max_num_reqs
-        num_scheduled_tokens_list[-1] += self.max_num_tokens % self.max_num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        # TODO: need to rum a dummy sampler for generate task
-        hidden_states = hidden_states[logit_indices]
-        output = self.model.compute_logits(hidden_states)
-        return output
+        with record_activation_peak(
+            "target_head",
+            "target.lm_head",
+            num_tokens=self.max_num_reqs,
+        ):
+            # For profile, have maximum num_reqs and that collectively have
+            # maximum num_tokens.
+            min_tokens_per_req = self.max_num_tokens // self.max_num_reqs
+            num_scheduled_tokens_list = [min_tokens_per_req] * self.max_num_reqs
+            num_scheduled_tokens_list[-1] += self.max_num_tokens % self.max_num_reqs
+            num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+            logit_indices = np.cumsum(num_scheduled_tokens) - 1
+            # TODO: need to rum a dummy sampler for generate task
+            hidden_states = hidden_states[logit_indices]
+            return self.model.compute_logits(hidden_states)
 
     def profile_run(self) -> None:
         self.eplb_warmup()
-        mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-            self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
-        origin_max_num_tokens = self.max_num_tokens
-        # in the pcp scenario, the split sequence needs to be used for profile run
-        # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
-        if self.pcp_size > 1:
-            self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
-        super().profile_run()
-        self.max_num_tokens = origin_max_num_tokens
+        activation_debug = bool(getattr(self.ascend_config, "activation_peak_debug", False))
+        configured_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
+        global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        activation_debug = activation_debug and (configured_rank == -1 or configured_rank == global_rank)
+        self.activation_peak_profile_result: ActivationPeakProfiler | None = None
+        with activation_peak_profile_session(enabled=activation_debug, rank=global_rank) as profiler:
+            if profiler is not None:
+                speculative_method = getattr(self.speculative_config, "method", "none")
+                logger.warning(
+                    "[ACTIVATION_PEAK][CONFIG] rank=%s ffn_chunking=%s "
+                    "ffn_chunk_size=%s speculative_method=%s max_num_tokens=%s",
+                    global_rank,
+                    bool(getattr(self.ascend_config, "enable_ffn_chunking", False)),
+                    int(getattr(self.ascend_config, "ffn_chunk_size", 0)),
+                    speculative_method,
+                    self.max_num_tokens,
+                )
+                mtp_hidden_buffer = getattr(
+                    self.get_model(),
+                    "get_mtp_target_hidden_states",
+                    lambda: None,
+                )()
+                if mtp_hidden_buffer is not None:
+                    record_activation_buffer(
+                        "mtp_hidden_buffer",
+                        "target.pre_hc_head_residual",
+                        mtp_hidden_buffer.numel() * mtp_hidden_buffer.element_size(),
+                    )
+                elif speculative_method == "mtp":
+                    record_activation_buffer(
+                        "mtp_hidden_buffer",
+                        "target.pre_hc_head_residual.not_allocated",
+                        0,
+                    )
+
+            mc2_tokens_capacity = get_mc2_tokens_capacity()
+            if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
+                mc2_tokens_capacity, self.vllm_config
+            ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+                self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            origin_max_num_tokens = self.max_num_tokens
+            try:
+                # in the pcp scenario, the split sequence needs to be used for profile run
+                # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
+                if self.pcp_size > 1:
+                    self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
+                super().profile_run()
+            finally:
+                self.max_num_tokens = origin_max_num_tokens
+        self.activation_peak_profile_result = profiler
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:

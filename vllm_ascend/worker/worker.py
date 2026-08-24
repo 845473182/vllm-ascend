@@ -566,6 +566,15 @@ class NPUWorker(WorkerBase):
             # The memory_profiling context will also compute torch_peak_increase
             # on exit, but we override it below with this pre-graph value.
             profile_torch_peak = torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+            activation_peak_profile = getattr(self.model_runner, "activation_peak_profile_result", None)
+            if activation_peak_profile is not None:
+                # Stage diagnostics reset allocator peak stats between nested
+                # scopes. Preserve their largest absolute peak so KV-cache
+                # sizing matches an uninstrumented profile run.
+                profile_torch_peak = max(
+                    profile_torch_peak,
+                    activation_peak_profile.overall_peak_bytes,
+                )
 
         # Override torch_peak_increase with the pre-graph-capture value to
         # avoid double-counting graph pool memory as activation memory.

@@ -26,6 +26,7 @@
 import math
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from itertools import islice
 
 import torch
@@ -72,6 +73,7 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
@@ -966,6 +968,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
+        self.activation_peak_phase = "mtp" if is_draft_layer else "target"
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_pre_v2(
@@ -986,17 +990,59 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        hidden_states = self.self_attn(**attn_kwargs)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        activation_peak_active = self.activation_peak_debug and is_activation_peak_profiling()
+        if activation_peak_active:
+            phase = self.activation_peak_phase
+            num_tokens = hidden_states.shape[0]
+            attention_peak_context = record_activation_peak(
+                f"{phase}_attention",
+                f"{phase}.layer.{self.layer_idx}.attention",
+                layer_idx=self.layer_idx,
+                num_tokens=num_tokens,
+            )
+        else:
+            phase = "target"
+            num_tokens = hidden_states.shape[0]
+            attention_peak_context = nullcontext()
+
+        with attention_peak_context:
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_kwargs = {
+                "positions": positions,
+                "hidden_states": hidden_states,
+                "llama_4_scaling": llama_4_scaling,
+            }
+            hidden_states = self.self_attn(**attn_kwargs)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        moe_peak_context = (
+            record_activation_peak(
+                f"{phase}_moe",
+                f"{phase}.layer.{self.layer_idx}.moe",
+                layer_idx=self.layer_idx,
+                num_tokens=num_tokens,
+            )
+            if activation_peak_active
+            else nullcontext()
+        )
+        with moe_peak_context:
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
 

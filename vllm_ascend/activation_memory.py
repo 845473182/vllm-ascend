@@ -308,7 +308,10 @@ def log_ffn_chunk_decision(
     if profiler is None:
         return
 
-    scope = profiler._scopes[-1] if profiler._scopes else None
+    scope = next(
+        (scope for scope in reversed(profiler._scopes) if scope.category in {"target_moe", "mtp_moe"}),
+        profiler._scopes[-1] if profiler._scopes else None,
+    )
     logger.warning(
         "[ACTIVATION_PEAK][FFN_CHUNK] rank=%s category=%s label=%s "
         "layer=%s comm=%s path=%s enabled=%s raw_tokens=%s "
@@ -326,4 +329,62 @@ def log_ffn_chunk_decision(
         num_chunks,
         applied,
         reason,
+    )
+
+
+def _current_mtp_moe_scope(profiler: ActivationPeakProfiler) -> _ActiveScope | None:
+    for scope in reversed(profiler._scopes):
+        if scope.category.startswith("mtp_") and ("moe" in scope.category or "ffn" in scope.category):
+            return scope
+    return None
+
+
+@contextmanager
+def record_mtp_moe_substage(
+    component: str,
+    label: str,
+    *,
+    num_tokens: int | None = None,
+) -> Iterator[None]:
+    """Record a detailed MTP MoE substage when inside an MTP MoE scope."""
+    profiler = _ACTIVE_PROFILER.get()
+    scope = _current_mtp_moe_scope(profiler) if profiler is not None else None
+    if profiler is None or scope is None:
+        yield
+        return
+
+    with profiler.record(
+        f"mtp_moe_{component}",
+        f"mtp.layer.{scope.layer_idx}.{label}",
+        layer_idx=scope.layer_idx,
+        num_tokens=num_tokens,
+    ):
+        yield
+
+
+def log_mtp_moe_chunk_detail(
+    *,
+    chunk_idx: int,
+    num_chunks: int,
+    raw_start: int,
+    raw_end: int,
+    dispatched_tokens: int | None,
+) -> None:
+    """Log raw and dispatched token counts for one MTP MoE chunk."""
+    profiler = _ACTIVE_PROFILER.get()
+    scope = _current_mtp_moe_scope(profiler) if profiler is not None else None
+    if profiler is None or scope is None:
+        return
+
+    logger.warning(
+        "[ACTIVATION_PEAK][FFN_CHUNK_DETAIL] rank=%s category=MTP_MOE "
+        "layer=%s chunk=%s/%s raw_range=%s:%s raw_tokens=%s dispatched_tokens=%s",
+        profiler.rank,
+        "-" if scope.layer_idx is None else scope.layer_idx,
+        chunk_idx + 1,
+        num_chunks,
+        raw_start,
+        raw_end,
+        raw_end - raw_start,
+        "-" if dispatched_tokens is None else dispatched_tokens,
     )

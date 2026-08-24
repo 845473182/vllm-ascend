@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
     log_ffn_chunk_decision,
+    log_mtp_moe_chunk_detail,
     record_activation_buffer,
     record_activation_peak,
+    record_mtp_moe_substage,
 )
 
 
@@ -127,3 +129,61 @@ def test_ffn_chunk_decision_uses_current_moe_scope():
         True,
         "chunked",
     )
+
+
+def test_mtp_moe_substage_and_chunk_detail_use_parent_scope():
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 110, 120, 130, 140, 140]),
+        memory_allocated=MagicMock(side_effect=[100, 105, 105, 100]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+        activation_peak_profile_session(enabled=True, rank=0) as profiler,
+        record_activation_peak("mtp_moe", "mtp.layer.0.moe", layer_idx=0, num_tokens=1500),
+    ):
+        with record_mtp_moe_substage("dispatch", "moe.chunk.1.dispatch", num_tokens=500):
+            log_mtp_moe_chunk_detail(
+                chunk_idx=0,
+                num_chunks=3,
+                raw_start=0,
+                raw_end=500,
+                dispatched_tokens=3040,
+            )
+
+    assert profiler is not None
+    assert [record.category for record in profiler.records] == ["mtp_moe_dispatch", "mtp_moe"]
+    detail_log = next(call for call in mock_warning.call_args_list if "[FFN_CHUNK_DETAIL]" in call.args[0])
+    assert detail_log.args[1:] == (0, 0, 1, 3, 0, 500, 500, 3040)
+
+
+def test_mtp_moe_substage_is_noop_in_target_scope():
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 110, 120, 120]),
+        memory_allocated=MagicMock(side_effect=[100, 100]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning") as mock_warning,
+        activation_peak_profile_session(enabled=True, rank=0) as profiler,
+        record_activation_peak("target_moe", "target.layer.0.moe", layer_idx=0, num_tokens=1500),
+    ):
+        with record_mtp_moe_substage("dispatch", "moe.dispatch", num_tokens=1500):
+            pass
+        log_mtp_moe_chunk_detail(
+            chunk_idx=0,
+            num_chunks=1,
+            raw_start=0,
+            raw_end=1500,
+            dispatched_tokens=9000,
+        )
+
+    assert profiler is not None
+    assert [record.category for record in profiler.records] == ["target_moe"]
+    assert not any("[FFN_CHUNK_DETAIL]" in call.args[0] for call in mock_warning.call_args_list)

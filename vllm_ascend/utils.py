@@ -142,6 +142,9 @@ def clear_enable_sp():
     enable_dsa_cp.cache_clear()
     enable_dsa_cp_with_layer_shard.cache_clear()
     enable_dsa_cp_with_o_proj_tp.cache_clear()
+    enable_attn_chunk.cache_clear()
+    get_attn_chunk_size.cache_clear()
+    enable_attn_chunk_verify.cache_clear()
     _libc_getenv.cache_clear()
 
 
@@ -1564,6 +1567,51 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     # 1) KV pooling is disabled, or
     # 2) KV pooling is enabled with kv_role == "kv_both".
     return kv_transfer_config is None or kv_transfer_config.kv_role == "kv_both"
+
+
+@lru_cache(maxsize=1)
+def enable_attn_chunk() -> bool:
+    """
+    attn chunk（indexer query 维分块）总开关。
+    独立于 enable_dsa_cp：它是一个纯粹的「前向内分块」开关，
+    与控制 o_proj 全量权重路径的 enable_dsa_cp 无逻辑绑定。
+    默认 False（保持原单次调用行为），需显式在 additional_config 中开启。
+    """
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if additional_config is None:
+        return False
+    return bool(additional_config.get("enable_attn_chunk", False))
+
+
+@lru_cache(maxsize=1)
+def get_attn_chunk_size() -> int:
+    """attn chunk 的分块大小（token 数）。<=0 表示关闭分块。"""
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if additional_config is None:
+        return 1024
+    return int(additional_config.get("attn_chunk_size", 1024))
+
+
+@lru_cache(maxsize=1)
+def enable_attn_chunk_verify() -> bool:
+    """一次性质检开关：分块结果与单次调用逐元素比对，不一致即报错。
+
+    仅用于真机首次验证（会额外跑一次全量 indexer 调用，有性能开销）。
+    验证通过后应在 additional_config 中关闭。
+    """
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if additional_config is None:
+        return False
+    return bool(additional_config.get("verify_attn_chunk", False))
 
 
 def check_gdn_layer(vllm_config) -> bool:

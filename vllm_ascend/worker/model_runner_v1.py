@@ -107,6 +107,7 @@ from vllm_ascend.activation_memory import (
     activation_peak_profile_session,
     record_activation_buffer,
     record_activation_peak,
+    request_activation_peak_session,
 )
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
@@ -2408,35 +2409,40 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                input_ids=input_ids,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": not clear_kv_metadata}
-                ),
-            ) as kv_connector_output,
+        with request_activation_peak_session(
+            enabled=self._request_peak_enabled() and self._is_prefill_step(num_tokens_padded, num_reqs),
+            rank=self._request_peak_rank(),
+            num_tokens=num_tokens_padded,
         ):
-            if self.cache_config.mamba_cache_mode == "align":
-                mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
+                    skip_compiled=has_encoder_input,
+                    has_sinks=self._has_sinks,
+                    input_ids=input_ids,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **(
+                        {"defer_finalize": not clear_kv_metadata}
+                    ),
+                ) as kv_connector_output,
+            ):
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3824,6 +3830,36 @@ class NPUModelRunner(GPUModelRunner):
             # TODO: need to rum a dummy sampler for generate task
             hidden_states = hidden_states[logit_indices]
             return self.model.compute_logits(hidden_states)
+
+    def _request_peak_enabled(self) -> bool:
+        """Whether per-request activation peak profiling is turned on.
+
+        Controlled by `activation_peak_debug` + a separate, more targeted
+        `activation_peak_serving` switch so that the startup profile_run
+        and the serving path can be toggled independently.
+        """
+        enabled = bool(
+            getattr(self.ascend_config, "activation_peak_debug", False)
+            and getattr(self.ascend_config, "activation_peak_serving", False)
+        )
+        if not enabled:
+            return False
+        configured_rank = int(getattr(self.ascend_config, "activation_peak_debug_rank", 0))
+        global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        return configured_rank == -1 or configured_rank == global_rank
+
+    def _request_peak_rank(self) -> int:
+        """Global rank used for serving-peak logging."""
+        return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+    def _is_prefill_step(self, num_tokens_padded: int, num_reqs: int) -> bool:
+        """Whether the current scheduler step is a prefill (multi-token) step.
+
+        Requests are chunk-prefilled, so the first step of each request is the
+        peak-heavy one; decode steps all share the same tiny footprint and
+        would only add log noise.
+        """
+        return num_tokens_padded > num_reqs
 
     def profile_run(self) -> None:
         self.eplb_warmup()

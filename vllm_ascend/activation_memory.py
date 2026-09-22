@@ -58,6 +58,7 @@ class ActivationPeakProfiler:
     records: list[ActivationPeakRecord] = field(default_factory=list)
     buffers: list[ActivationBufferRecord] = field(default_factory=list)
     overall_peak_bytes: int = 0
+    verbose_stages: bool = False
     _scopes: list[_ActiveScope] = field(default_factory=list)
 
     def _synchronize(self) -> None:
@@ -117,21 +118,22 @@ class ActivationPeakProfiler:
                 elapsed_ms=(time.perf_counter() - scope.started_at) * 1000,
             )
             self.records.append(record)
-            logger.warning(
-                "[ACTIVATION_PEAK][STAGE] rank=%s category=%s label=%s "
-                "layer=%s tokens=%s baseline=%.3f GiB peak=%.3f GiB "
-                "growth=%.3f MiB retained=%+.3f MiB elapsed=%.3f ms",
-                self.rank,
-                category.upper(),
-                label,
-                "-" if layer_idx is None else layer_idx,
-                "-" if num_tokens is None else num_tokens,
-                baseline_bytes / _GIB,
-                peak_bytes / _GIB,
-                record.peak_growth_bytes / _MIB,
-                record.retained_bytes / _MIB,
-                record.elapsed_ms,
-            )
+            if self.verbose_stages:
+                logger.warning(
+                    "[ACTIVATION_PEAK][STAGE] rank=%s category=%s label=%s "
+                    "layer=%s tokens=%s baseline=%.3f GiB peak=%.3f GiB "
+                    "growth=%.3f MiB retained=%+.3f MiB elapsed=%.3f ms",
+                    self.rank,
+                    category.upper(),
+                    label,
+                    "-" if layer_idx is None else layer_idx,
+                    "-" if num_tokens is None else num_tokens,
+                    baseline_bytes / _GIB,
+                    peak_bytes / _GIB,
+                    record.peak_growth_bytes / _MIB,
+                    record.retained_bytes / _MIB,
+                    record.elapsed_ms,
+                )
 
     def record_buffer(self, category: str, label: str, size_bytes: int) -> None:
         record = ActivationBufferRecord(
@@ -242,12 +244,13 @@ def activation_peak_profile_session(
     *,
     enabled: bool,
     rank: int,
+    verbose_stages: bool = True,
 ) -> Iterator[ActivationPeakProfiler | None]:
     if not enabled:
         yield None
         return
 
-    profiler = ActivationPeakProfiler(rank=rank)
+    profiler = ActivationPeakProfiler(rank=rank, verbose_stages=verbose_stages)
     profiler._synchronize()
     profiler.overall_peak_bytes = int(torch.npu.max_memory_allocated())
     torch.npu.reset_peak_memory_stats()
@@ -261,6 +264,48 @@ def activation_peak_profile_session(
     finally:
         profiler._checkpoint()
         _ACTIVE_PROFILER.reset(token)
+        profiler.log_summary()
+
+
+@contextmanager
+def request_activation_peak_session(
+    *,
+    enabled: bool,
+    rank: int,
+    num_tokens: int,
+) -> Iterator[None]:
+    """Per-forward activation peak session for real (served) requests.
+
+    Unlike `activation_peak_profile_session` (used by the startup dummy
+    runs), this wraps one real scheduler step and prints the per-category
+    summary exactly once per invocation, without the per-stage detail log.
+    """
+    if not enabled:
+        yield
+        return
+
+    profiler = ActivationPeakProfiler(rank=rank)
+    profiler._synchronize()
+    profiler.overall_peak_bytes = int(torch.npu.max_memory_allocated())
+    torch.npu.reset_peak_memory_stats()
+    token = _ACTIVE_PROFILER.set(profiler)
+    logger.warning(
+        "[ACTIVATION_PEAK] rank=%s serving-step profiling started (num_tokens=%s); "
+        "NPU synchronization is active and intended only for debugging.",
+        rank,
+        num_tokens,
+    )
+    try:
+        yield
+    finally:
+        profiler._checkpoint()
+        _ACTIVE_PROFILER.reset(token)
+        logger.warning(
+            "[ACTIVATION_PEAK][REQUEST] rank=%s num_tokens=%s absolute_peak=%.3f GiB",
+            rank,
+            num_tokens,
+            profiler.overall_peak_bytes / _GIB,
+        )
         profiler.log_summary()
 
 

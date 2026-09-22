@@ -22,6 +22,9 @@ from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     AscendDeviceType,
+    enable_attn_chunk,
+    enable_attn_chunk_verify,
+    get_attn_chunk_size,
     enable_dsa_cp_with_o_proj_tp,
     get_ascend_device_type,
     olora_tp_enable,
@@ -976,6 +979,12 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         self.eps = kwargs["eps"]
 
+        # attn chunk 独立开关：默认关闭；开启后 prefill 阶段对 indexer 的
+        # query 维做分块，以降低该阶段的激活峰值。
+        self.enable_attn_chunk = enable_attn_chunk()
+        self.attn_chunk_size = get_attn_chunk_size()
+        self.verify_attn_chunk = enable_attn_chunk_verify()
+
         self.attn_sink = kwargs["attn_sink"]
 
         self.vllm_config = get_current_vllm_config()
@@ -1383,17 +1392,84 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     attn_metadata=attn_metadata,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                 )
-                compress_topk_idxs = self._indexer_select_topk(
-                    x=hidden_states_local,
-                    qr=qr_local,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    cos=local_cos,
-                    sin=local_sin,
-                    actual_seq_lengths_query=local_seq_lengths_query,
-                    actual_seq_lengths_key=local_seq_lengths_key,
-                    qr_pertoken_scale=qr_pertoken_scale_local,
-                )
+                def _indexer_single_call():
+                    # 原始单次调用路径（关闭分块 / 小输入 / 质检基准）
+                    return self._indexer_select_topk(
+                        x=hidden_states_local,
+                        qr=qr_local,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=local_cos,
+                        sin=local_sin,
+                        actual_seq_lengths_query=local_seq_lengths_query,
+                        actual_seq_lengths_key=local_seq_lengths_key,
+                        qr_pertoken_scale=qr_pertoken_scale_local,
+                    )
+
+                if has_prefill:
+                    seq_len = hidden_states_local.size(0)
+                    chunk_size = self.attn_chunk_size
+                    # 三条启用条件：开关打开 且 chunk_size 有效 且 输入确实超过一个分块
+                    use_chunk = (
+                        self.enable_attn_chunk
+                        and chunk_size is not None
+                        and chunk_size > 0
+                        and seq_len > chunk_size
+                    )
+
+                    if not use_chunk:
+                        compress_topk_idxs = _indexer_single_call()
+                    else:
+                        # local_seq_lengths_query == cp_metadata.local_query_start_loc：
+                        # 打包 local query 的【累积起始数组】[n_seq+1]，
+                        # starts[0]==0，starts[-1]==seq_len。
+                        starts = local_seq_lengths_query
+                        seq_begins = starts[:-1]
+                        seq_ends = starts[1:]
+
+                        def _indexer_chunk_call(cs: int, ce: int, q_start_loc: torch.Tensor):
+                            return self._indexer_select_topk(
+                                x=hidden_states_local[cs:ce, :],
+                                qr=qr_local[cs:ce, :],
+                                kv_cache=kv_cache,
+                                attn_metadata=attn_metadata,
+                                cos=local_cos[cs:ce, :, :, :],
+                                sin=local_sin[cs:ce, :, :, :],
+                                actual_seq_lengths_query=q_start_loc,
+                                # key 侧不变：chunk 仍读取全部 local 序列的 indexer KV，
+                                # 与 block_table 行保持对齐（窗口外序列 query 长度为 0）。
+                                actual_seq_lengths_key=local_seq_lengths_key,
+                                qr_pertoken_scale=(
+                                    qr_pertoken_scale_local[cs:ce]
+                                    if qr_pertoken_scale_local is not None
+                                    else None
+                                ),
+                            )
+
+                        compress_topk_idxs_list = []
+                        for cs in range(0, seq_len, chunk_size):
+                            ce = min(cs + chunk_size, seq_len)
+                            # 序列区间 [seq_begins[i], seq_ends[i]) 与窗口 [cs, ce) 的交叠长度
+                            # （device 上计算，无 host 同步；不相交为 0）
+                            overlap = (seq_ends.clamp(max=ce) - seq_begins.clamp(min=cs)).clamp_(min=0)
+                            # 重建本 chunk 的累积起始数组（长度 n_seq+1，首元素 0）
+                            chunk_start_loc = torch.cat(
+                                [overlap.new_zeros(1), torch.cumsum(overlap, dim=0)]
+                            )
+                            compress_topk_idxs_list.append(_indexer_chunk_call(cs, ce, chunk_start_loc))
+                        compress_topk_idxs = torch.cat(compress_topk_idxs_list, dim=0)
+
+                        # 一次性质检：分块结果必须与单次调用逐元素一致
+                        if self.verify_attn_chunk:
+                            ref = _indexer_single_call()
+                            if not torch.equal(compress_topk_idxs, ref):
+                                raise RuntimeError(
+                                    "attn chunk mismatch vs single call: check kernel support "
+                                    "for zero-length query seqs / position-sensitive masking "
+                                    "(see A2/A3 in this file header)"
+                                )
+                else:
+                    compress_topk_idxs = _indexer_single_call()
 
             coff = 2 if self.compressor_overlap else 1
             compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(

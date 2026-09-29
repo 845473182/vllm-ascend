@@ -187,3 +187,60 @@ def test_mtp_moe_substage_is_noop_in_target_scope():
     assert profiler is not None
     assert [record.category for record in profiler.records] == ["target_moe"]
     assert not any("[FFN_CHUNK_DETAIL]" in call.args[0] for call in mock_warning.call_args_list)
+
+
+def test_attn_peak_phase_is_derived_from_layer_name():
+    from vllm_ascend.attention.context_parallel.dsa_cp import _attn_peak_phase
+
+    assert _attn_peak_phase("model.layers.0.self_attn") == "target"
+    assert _attn_peak_phase("model.layers.61.self_attn") == "target"
+    assert _attn_peak_phase("mtp.0.self_attn") == "mtp"
+
+
+def test_attn_substage_scopes_nest_under_attention_scope():
+    fake_npu = SimpleNamespace(
+        synchronize=MagicMock(),
+        reset_peak_memory_stats=MagicMock(),
+        max_memory_allocated=MagicMock(side_effect=[100, 110, 130, 170, 180, 180]),
+        memory_allocated=MagicMock(side_effect=[100, 120, 125, 105]),
+    )
+
+    with (
+        patch("vllm_ascend.activation_memory.torch.npu", fake_npu, create=True),
+        patch("vllm_ascend.activation_memory.logger.warning"),
+        activation_peak_profile_session(enabled=True, rank=0) as profiler,
+    ):
+        with record_activation_peak("target_attention", "target.layer.0.attention", layer_idx=0, num_tokens=32):
+            with record_activation_peak(
+                "target_attn_q_proj", "target.layer.model.layers.0.self_attn.q_proj", num_tokens=32
+            ):
+                pass
+            with record_activation_peak(
+                "target_attn_core", "target.layer.model.layers.0.self_attn.sparse_attn", num_tokens=32
+            ):
+                pass
+
+    assert profiler is not None
+    assert [record.category for record in profiler.records] == [
+        "target_attn_q_proj",
+        "target_attn_core",
+        "target_attention",
+    ]
+    # 子 scope 峰值须回传父 scope，不丢失全局 profile 峰值。
+    assert profiler.overall_peak_bytes == 180
+
+
+def test_attn_substage_categories_are_verbose():
+    """Attn 子阶段的 category 不能落入 MoE 聚合分支（避免被逐层日志吞掉）。"""
+    from vllm_ascend.activation_memory import _is_moe_stage
+
+    for category in (
+        "target_attn_q_proj",
+        "target_attn_kv_proj",
+        "target_attn_indexer_update",
+        "target_attn_indexer_topk",
+        "target_attn_compressor",
+        "target_attn_core",
+        "target_attn_o_proj",
+    ):
+        assert not _is_moe_stage(category), category

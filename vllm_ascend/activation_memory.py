@@ -18,6 +18,15 @@ _MIB = 1024**2
 _GIB = 1024**3
 
 
+def _is_moe_stage(category: str) -> bool:
+    """Whether a category is an MoE/FFN stage.
+
+    MoE stages run once per layer, so their per-stage logs are far too noisy;
+    they are aggregated into the summary instead of printed individually.
+    """
+    return "moe" in category or "ffn" in category
+
+
 @dataclass(frozen=True)
 class ActivationPeakRecord:
     category: str
@@ -118,7 +127,7 @@ class ActivationPeakProfiler:
                 elapsed_ms=(time.perf_counter() - scope.started_at) * 1000,
             )
             self.records.append(record)
-            if self.verbose_stages:
+            if self.verbose_stages and not _is_moe_stage(category):
                 logger.warning(
                     "[ACTIVATION_PEAK][STAGE] rank=%s category=%s label=%s "
                     "layer=%s tokens=%s baseline=%.3f GiB peak=%.3f GiB "
@@ -164,11 +173,12 @@ class ActivationPeakProfiler:
 
         for category, record in sorted(category_winners.items()):
             logger.warning(
-                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s max_growth=%.3f MiB "
+                "[ACTIVATION_PEAK][SUMMARY] rank=%s category=%s max_growth=%.3f MiB (%.3f GiB) "
                 "absolute_peak=%.3f GiB label=%s layer=%s tokens=%s",
                 self.rank,
                 category.upper(),
                 record.peak_growth_bytes / _MIB,
+                record.peak_growth_bytes / _GIB,
                 record.peak_bytes / _GIB,
                 record.label,
                 "-" if record.layer_idx is None else record.layer_idx,

@@ -277,10 +277,20 @@ class AscendConfig:
             )
         if self.activation_peak_debug and not getattr(vllm_config.model_config, "enforce_eager", False):
             raise ValueError("activation_peak_debug requires eager mode; set enforce_eager=true.")
-        if self.activation_peak_debug:
+        self.activation_peak_serving = additional_config.get("activation_peak_serving", False)
+        if not isinstance(self.activation_peak_serving, bool):
+            raise ValueError(
+                "activation_peak_serving must be a boolean, got "
+                f"{type(self.activation_peak_serving).__name__}: {self.activation_peak_serving}"
+            )
+        if self.activation_peak_serving and not self.activation_peak_debug:
+            raise ValueError(
+                "activation_peak_serving requires activation_peak_debug to be enabled as well."
+            )
+        if self.activation_peak_serving:
             logger.warning_once(
-                "Activation peak debugging is enabled for profile_run on rank %s. "
-                "NPU synchronization will make startup profiling slower.",
+                "Activation peak debugging is enabled for serving steps on rank %s. "
+                "NPU synchronization will slow down every profiled prefill step.",
                 "all" if self.activation_peak_debug_rank == -1 else self.activation_peak_debug_rank,
             )
 

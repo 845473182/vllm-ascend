@@ -192,6 +192,32 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_activation_peak_serving_requires_activation_peak_debug(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.model_config = self._make_model_config()
+        test_vllm_config.additional_config = {"activation_peak_serving": True, "refresh": True}
+
+        with self.assertRaisesRegex(ValueError, "activation_peak_serving requires activation_peak_debug"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_activation_peak_serving_enabled_with_activation_peak_debug(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.model_config = self._make_model_config()
+        test_vllm_config.additional_config = {
+            "activation_peak_debug": True,
+            "activation_peak_serving": True,
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.activation_peak_debug)
+        self.assertTrue(ascend_config.activation_peak_serving)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {

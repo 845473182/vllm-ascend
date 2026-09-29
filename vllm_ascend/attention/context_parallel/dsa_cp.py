@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
@@ -8,9 +9,11 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.activation_memory import is_activation_peak_profiling, record_activation_peak
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
@@ -19,6 +22,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -58,6 +62,15 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     }
+
+
+def _attn_peak_phase(layer_name: str) -> str:
+    """Profile category prefix ("target"/"mtp") derived from the layer name.
+
+    MTP layers are registered as `mtp.<idx>.self_attn` while target-model
+    layers use `model.layers.<idx>.self_attn`.
+    """
+    return "mtp" if layer_name.startswith("mtp.") else "target"
 
 
 @dataclass
@@ -984,6 +997,16 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self.enable_attn_chunk = enable_attn_chunk()
         self.attn_chunk_size = get_attn_chunk_size()
         self.verify_attn_chunk = enable_attn_chunk_verify()
+        # 每个 forward 会经过多层 indexer，用于日志限流，避免刷屏。
+        self._attn_chunk_log_count = 0
+        # 激活峰值细分埋点开关（与 deepseek_v4.py 中的层级埋点共用同一配置）。
+        self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
+        if self.enable_attn_chunk:
+            logger.warning_once(
+                "[ATTN_CHUNK] enabled with attn_chunk_size=%s (verify=%s)",
+                self.attn_chunk_size,
+                self.verify_attn_chunk,
+            )
 
         self.attn_sink = kwargs["attn_sink"]
 
@@ -1208,6 +1231,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 AscendAttentionState.SpecDecoding,
             }
         )
+        phase = _attn_peak_phase(layer_name)
         local_attn_output, o_proj_full_handles = self._forward(
             layer_name,
             hidden_states,
@@ -1225,46 +1249,56 @@ class AscendDSACPImpl(DSAAttentionImpl):
         num_tokens = o_proj_input.shape[0]
 
         # o
+        o_proj_context = (
+            record_activation_peak(
+                f"{phase}_attn_o_proj",
+                f"{phase}.layer.{layer_name}.o_proj",
+                num_tokens=num_tokens,
+            )
+            if self.activation_peak_debug and is_activation_peak_profiling()
+            else nullcontext()
+        )
         if full_gather_wo_a_enabled:
             self._switch_o_proj_to_full_weight(o_proj_full_handles)
         o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
         try:
-            if get_ascend_device_type() in {AscendDeviceType.A5}:
-                o = o_proj_input.view(num_tokens, o_proj_groups, -1)
-                o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
-                o = torch_npu.npu_transpose_quant_batchmatmul(
-                    o,
-                    self.wo_a.weight,
-                    dtype=torch.bfloat16,
-                    bias=None,
-                    group_sizes=(0, 0, 32),
-                    x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
-                    x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
-                    perm_x1=(1, 0, 2),
-                    perm_x2=(0, 1, 2),
-                    perm_y=(1, 0, 2),
-                )
-                o = o.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
-            else:
-                o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
-                if olora_tp_enable():
-                    o_proj_input = self.wo_a(o_proj_input)
-                else:
-                    # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
-                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                        o_proj_input,
+            with o_proj_context:
+                if get_ascend_device_type() in {AscendDeviceType.A5}:
+                    o = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                    o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+                    o = torch_npu.npu_transpose_quant_batchmatmul(
+                        o,
                         self.wo_a.weight,
+                        dtype=torch.bfloat16,
                         bias=None,
-                        scale=None,
+                        group_sizes=(0, 0, 32),
+                        x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
+                        x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
                         perm_x1=(1, 0, 2),
                         perm_x2=(0, 1, 2),
                         perm_y=(1, 0, 2),
-                        batch_split_factor=1,
                     )
-                o_proj_input = o_proj_input.reshape(num_tokens, -1)
-                output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
+                    o = o.reshape(num_tokens, -1)
+                    output[...] = self._apply_wo_b(o, full_gather_wo_a_enabled)
+                else:
+                    o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                    if olora_tp_enable():
+                        o_proj_input = self.wo_a(o_proj_input)
+                    else:
+                        # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
+                        # o = torch.einsum("tgd,grd->tgr", o, wo_a)
+                        o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                            o_proj_input,
+                            self.wo_a.weight,
+                            bias=None,
+                            scale=None,
+                            perm_x1=(1, 0, 2),
+                            perm_x2=(0, 1, 2),
+                            perm_y=(1, 0, 2),
+                            batch_split_factor=1,
+                        )
+                    o_proj_input = o_proj_input.reshape(num_tokens, -1)
+                    output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
         finally:
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_tp_weight()
@@ -1308,90 +1342,122 @@ class AscendDSACPImpl(DSAAttentionImpl):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
-        if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
-            self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
-        ):
-            q_a = self.wq_a(hidden_states_local)
-            qr_local, qr_pertoken_scale_local = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                q_a, self.q_norm.weight, epsilon=self.eps
+        phase = _attn_peak_phase(layer_name)
+        peak_active = self.activation_peak_debug and is_activation_peak_profiling()
+        q_proj_context = (
+            record_activation_peak(
+                f"{phase}_attn_q_proj",
+                f"{phase}.layer.{layer_name}.q_proj",
+                num_tokens=hidden_states_local.shape[0],
             )
-            if getattr(self.wq_b, "_chunk_size", 0):
-                bias = self.wq_b.bias
-                chunk_size = self.wq_b._chunk_size
-                bias_1 = bias[:chunk_size] if bias is not None else None
-                bias_2 = bias[chunk_size:] if bias is not None else None
-                q = torch.cat(
-                    [
-                        torch_npu.npu_quant_matmul(
-                            qr_local,
-                            self.wq_b.weight_1,
-                            self.wq_b.weight_1_scale,
-                            pertoken_scale=qr_pertoken_scale_local,
-                            bias=bias_1,
-                            output_dtype=hidden_states_local.dtype,
-                        ),
-                        torch_npu.npu_quant_matmul(
-                            qr_local,
-                            self.wq_b.weight_2,
-                            self.wq_b.weight_2_scale,
-                            pertoken_scale=qr_pertoken_scale_local,
-                            bias=bias_2,
-                            output_dtype=hidden_states_local.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-            else:
-                q = torch_npu.npu_quant_matmul(
-                    qr_local,
-                    self.wq_b.weight,
-                    self.wq_b.weight_scale,
-                    pertoken_scale=qr_pertoken_scale_local,
-                    bias=self.wq_b.bias,
-                    output_dtype=hidden_states_local.dtype,
-                )
-        else:
-            qr_local = self.q_norm(self.wq_a(hidden_states_local))
-            q = self.wq_b(qr_local)
-            qr_pertoken_scale_local = None
-
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-
-        q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            q.unsqueeze(1),
-            local_cos,
-            local_sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
+            if peak_active
+            else nullcontext()
         )
+        with q_proj_context:
+            if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
+                self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
+            ):
+                q_a = self.wq_a(hidden_states_local)
+                qr_local, qr_pertoken_scale_local = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
+                    q_a, self.q_norm.weight, epsilon=self.eps
+                )
+                if getattr(self.wq_b, "_chunk_size", 0):
+                    bias = self.wq_b.bias
+                    chunk_size = self.wq_b._chunk_size
+                    bias_1 = bias[:chunk_size] if bias is not None else None
+                    bias_2 = bias[chunk_size:] if bias is not None else None
+                    q = torch.cat(
+                        [
+                            torch_npu.npu_quant_matmul(
+                                qr_local,
+                                self.wq_b.weight_1,
+                                self.wq_b.weight_1_scale,
+                                pertoken_scale=qr_pertoken_scale_local,
+                                bias=bias_1,
+                                output_dtype=hidden_states_local.dtype,
+                            ),
+                            torch_npu.npu_quant_matmul(
+                                qr_local,
+                                self.wq_b.weight_2,
+                                self.wq_b.weight_2_scale,
+                                pertoken_scale=qr_pertoken_scale_local,
+                                bias=bias_2,
+                                output_dtype=hidden_states_local.dtype,
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    q = torch_npu.npu_quant_matmul(
+                        qr_local,
+                        self.wq_b.weight,
+                        self.wq_b.weight_scale,
+                        pertoken_scale=qr_pertoken_scale_local,
+                        bias=self.wq_b.bias,
+                        output_dtype=hidden_states_local.dtype,
+                    )
+            else:
+                qr_local = self.q_norm(self.wq_a(hidden_states_local))
+                q = self.wq_b(qr_local)
+                qr_pertoken_scale_local = None
+
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+
+            q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                q.unsqueeze(1),
+                local_cos,
+                local_sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
 
         o_proj_full_handles = self._maybe_all_gather_o_proj_full_weight(full_gather_wo_a_enabled)
 
-        kv = self.wkv(hidden_states_cache)
-        kv = self.kv_norm(kv)
-        assert self.rope_head_dim is not None
-        kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            kv.unsqueeze(1),
-            cos[: kv.shape[0]],
-            sin[: kv.shape[0]],
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
+        kv_proj_context = (
+            record_activation_peak(
+                f"{phase}_attn_kv_proj",
+                f"{phase}.layer.{layer_name}.kv_proj",
+                num_tokens=hidden_states_cache.shape[0],
+            )
+            if peak_active
+            else nullcontext()
         )
-        DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping)
+        with kv_proj_context:
+            kv = self.wkv(hidden_states_cache)
+            kv = self.kv_norm(kv)
+            assert self.rope_head_dim is not None
+            kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                kv.unsqueeze(1),
+                cos[: kv.shape[0]],
+                sin[: kv.shape[0]],
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
+            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping)
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
             assert compressor_attn_metadata.req_metadata is not None
             assert compressor_kv_state_metadata.req_metadata is not None
             if self.compress_ratio == 4:
-                self._update_indexer_cache(
-                    x=hidden_states_cache,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    actual_seq_lengths_query=actual_seq_lengths_query,
+                indexer_update_context = (
+                    record_activation_peak(
+                        f"{phase}_attn_indexer_update",
+                        f"{phase}.layer.{layer_name}.indexer_update",
+                        num_tokens=hidden_states_cache.shape[0],
+                    )
+                    if peak_active
+                    else nullcontext()
                 )
+                with indexer_update_context:
+                    self._update_indexer_cache(
+                        x=hidden_states_cache,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                    )
                 def _indexer_single_call():
                     # 原始单次调用路径（关闭分块 / 小输入 / 质检基准）
                     return self._indexer_select_topk(
@@ -1416,89 +1482,142 @@ class AscendDSACPImpl(DSAAttentionImpl):
                         and chunk_size > 0
                         and seq_len > chunk_size
                     )
-
-                    if not use_chunk:
-                        compress_topk_idxs = _indexer_single_call()
-                    else:
-                        # local_seq_lengths_query == cp_metadata.local_query_start_loc：
-                        # 打包 local query 的【累积起始数组】[n_seq+1]，
-                        # starts[0]==0，starts[-1]==seq_len。
-                        starts = local_seq_lengths_query
-                        seq_begins = starts[:-1]
-                        seq_ends = starts[1:]
-
-                        def _indexer_chunk_call(cs: int, ce: int, q_start_loc: torch.Tensor):
-                            return self._indexer_select_topk(
-                                x=hidden_states_local[cs:ce, :],
-                                qr=qr_local[cs:ce, :],
-                                kv_cache=kv_cache,
-                                attn_metadata=attn_metadata,
-                                cos=local_cos[cs:ce, :, :, :],
-                                sin=local_sin[cs:ce, :, :, :],
-                                actual_seq_lengths_query=q_start_loc,
-                                # key 侧不变：chunk 仍读取全部 local 序列的 indexer KV，
-                                # 与 block_table 行保持对齐（窗口外序列 query 长度为 0）。
-                                actual_seq_lengths_key=local_seq_lengths_key,
-                                qr_pertoken_scale=(
-                                    qr_pertoken_scale_local[cs:ce]
-                                    if qr_pertoken_scale_local is not None
-                                    else None
-                                ),
+                    if self.enable_attn_chunk and self._attn_chunk_log_count < 10:
+                        self._attn_chunk_log_count += 1
+                        if use_chunk:
+                            num_chunks = (seq_len + chunk_size - 1) // chunk_size
+                            logger.warning(
+                                "[ATTN_CHUNK] rank=%s seq_len=%s split into %s chunk(s) "
+                                "(chunk_size=%s, layer=%s)",
+                                self.tp_rank,
+                                seq_len,
+                                num_chunks,
+                                chunk_size,
+                                layer_name,
+                            )
+                        else:
+                            logger.warning(
+                                "[ATTN_CHUNK] rank=%s skip chunking: seq_len=%s <= chunk_size=%s, "
+                                "single indexer call (layer=%s)",
+                                self.tp_rank,
+                                seq_len,
+                                chunk_size,
+                                layer_name,
                             )
 
-                        compress_topk_idxs_list = []
-                        for cs in range(0, seq_len, chunk_size):
-                            ce = min(cs + chunk_size, seq_len)
-                            # 序列区间 [seq_begins[i], seq_ends[i]) 与窗口 [cs, ce) 的交叠长度
-                            # （device 上计算，无 host 同步；不相交为 0）
-                            overlap = (seq_ends.clamp(max=ce) - seq_begins.clamp(min=cs)).clamp_(min=0)
-                            # 重建本 chunk 的累积起始数组（长度 n_seq+1，首元素 0）
-                            chunk_start_loc = torch.cat(
-                                [overlap.new_zeros(1), torch.cumsum(overlap, dim=0)]
-                            )
-                            compress_topk_idxs_list.append(_indexer_chunk_call(cs, ce, chunk_start_loc))
-                        compress_topk_idxs = torch.cat(compress_topk_idxs_list, dim=0)
+                    indexer_topk_context = (
+                        record_activation_peak(
+                            f"{phase}_attn_indexer_topk",
+                            f"{phase}.layer.{layer_name}.indexer_topk",
+                            num_tokens=seq_len,
+                        )
+                        if peak_active
+                        else nullcontext()
+                    )
+                    with indexer_topk_context:
+                        if not use_chunk:
+                            compress_topk_idxs = _indexer_single_call()
+                        else:
+                            # local_seq_lengths_query == cp_metadata.local_query_start_loc：
+                            # 打包 local query 的【累积起始数组】[n_seq+1]，
+                            # starts[0]==0，starts[-1]==seq_len。
+                            starts = local_seq_lengths_query
+                            seq_begins = starts[:-1]
+                            seq_ends = starts[1:]
 
-                        # 一次性质检：分块结果必须与单次调用逐元素一致
-                        if self.verify_attn_chunk:
-                            ref = _indexer_single_call()
-                            if not torch.equal(compress_topk_idxs, ref):
-                                raise RuntimeError(
-                                    "attn chunk mismatch vs single call: check kernel support "
-                                    "for zero-length query seqs / position-sensitive masking "
-                                    "(see A2/A3 in this file header)"
+                            def _indexer_chunk_call(cs: int, ce: int, q_start_loc: torch.Tensor):
+                                return self._indexer_select_topk(
+                                    x=hidden_states_local[cs:ce, :],
+                                    qr=qr_local[cs:ce, :],
+                                    kv_cache=kv_cache,
+                                    attn_metadata=attn_metadata,
+                                    cos=local_cos[cs:ce, :, :, :],
+                                    sin=local_sin[cs:ce, :, :, :],
+                                    actual_seq_lengths_query=q_start_loc,
+                                    # key 侧不变：chunk 仍读取全部 local 序列的 indexer KV，
+                                    # 与 block_table 行保持对齐（窗口外序列 query 长度为 0）。
+                                    actual_seq_lengths_key=local_seq_lengths_key,
+                                    qr_pertoken_scale=(
+                                        qr_pertoken_scale_local[cs:ce]
+                                        if qr_pertoken_scale_local is not None
+                                        else None
+                                    ),
                                 )
+
+                            # 预分配完整输出，chunk 结果直接写入对应区间：
+                            # 避免 list 持有全部 chunk 输出 + torch.cat 再拷一份
+                            # 导致的 ~2x 瞬时峰值（32k 输入下会 OOM）。
+                            compress_topk_idxs = None
+                            for cs in range(0, seq_len, chunk_size):
+                                ce = min(cs + chunk_size, seq_len)
+                                # 序列区间 [seq_begins[i], seq_ends[i]) 与窗口 [cs, ce) 的交叠长度
+                                # （device 上计算，无 host 同步；不相交为 0）
+                                overlap = (seq_ends.clamp(max=ce) - seq_begins.clamp(min=cs)).clamp_(min=0)
+                                # 重建本 chunk 的累积起始数组（长度 n_seq+1，首元素 0）。
+                                # cumsum 会把结果提升为 int64，而 lightning indexer 的 tiling
+                                # 只接受 int32，这里显式转回 int32。
+                                chunk_start_loc = torch.cat(
+                                    [overlap.new_zeros(1), torch.cumsum(overlap, dim=0)]
+                                ).to(torch.int32)
+                                chunk_out = _indexer_chunk_call(cs, ce, chunk_start_loc)
+                                if compress_topk_idxs is None:
+                                    # 用第一个 chunk 的输出推导完整形状
+                                    full_shape = (seq_len,) + tuple(chunk_out.shape[1:])
+                                    compress_topk_idxs = torch.empty(
+                                        full_shape, dtype=chunk_out.dtype, device=chunk_out.device
+                                    )
+                                compress_topk_idxs[cs:ce] = chunk_out
+
+                            # 一次性质检：分块结果必须与单次调用逐元素一致
+                            if self.verify_attn_chunk:
+                                ref = _indexer_single_call()
+                                if not torch.equal(compress_topk_idxs, ref):
+                                    raise RuntimeError(
+                                        "attn chunk mismatch vs single call: check kernel support "
+                                        "for zero-length query seqs / position-sensitive masking "
+                                        "(see A2/A3 in this file header)"
+                                    )
                 else:
                     compress_topk_idxs = _indexer_single_call()
 
-            coff = 2 if self.compressor_overlap else 1
-            compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
-                compressor_attn_metadata.req_metadata,
+            compressor_context = (
+                record_activation_peak(
+                    f"{phase}_attn_compressor",
+                    f"{phase}.layer.{layer_name}.compressor",
+                    num_tokens=hidden_states_cache.shape[0],
+                )
+                if peak_active
+                else nullcontext()
             )
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states_cache,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                state_block_table=compressor_kv_state_metadata.req_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=req_metadata.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1,
-            )
+            with compressor_context:
+                coff = 2 if self.compressor_overlap else 1
+                compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
+                    compressor_attn_metadata.req_metadata,
+                )
+                compressed_kv = torch.ops._C_ascend.compressor(
+                    hidden_states_cache,
+                    self.compressor_wkv.weight,
+                    self.compressor_wgate.weight,
+                    state_cache.squeeze(-2),
+                    self.compressor_ape,
+                    self.compressor_norm.weight,
+                    compress_sin.view(-1, compress_sin.shape[-1]),
+                    compress_cos.view(-1, compress_cos.shape[-1]),
+                    state_block_table=compressor_kv_state_metadata.req_metadata.block_table,
+                    cu_seqlens=actual_seq_lengths_query,
+                    seqused=None,
+                    start_pos=req_metadata.start_pos,
+                    rope_head_dim=self.rope_head_dim,
+                    cmp_ratio=self.compress_ratio,
+                    coff=coff,
+                    norm_eps=self.compressor_norm_eps,
+                    rotary_mode=2,
+                    cache_mode=1,
+                )
 
-            if compressed_kv.numel() == 0:
-                compressed_kv = None
-            DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+                if compressed_kv.numel() == 0:
+                    compressed_kv = None
+                DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
@@ -1521,45 +1640,55 @@ class AscendDSACPImpl(DSAAttentionImpl):
             **extra_attn_kwargs,
         )
 
-        if self.compress_ratio <= 1:
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                ori_block_table=swa_metadata.req_metadata.block_table,
-                metadata=swa_metadata.req_metadata.sas_metadata,
-                **common_attn_kwargs,
-            )[0]
-        elif self.compress_ratio == 4:
-            assert compressor_attn_metadata.req_metadata is not None
-            DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
-                common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
+        attn_core_context = (
+            record_activation_peak(
+                f"{phase}_attn_core",
+                f"{phase}.layer.{layer_name}.sparse_attn",
+                num_tokens=q.shape[0],
             )
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                cmp_kv=compress_kv_cache,
-                cmp_sparse_indices=compress_topk_idxs,
-                ori_block_table=swa_metadata.req_metadata.block_table,
-                cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                metadata=req_metadata.sas_metadata,
-                cmp_mask_mode=3,
-                **common_attn_kwargs,
-            )[0]
-        else:
-            assert compressor_attn_metadata.req_metadata is not None
-            DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
-                common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
-            )
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                cmp_kv=compress_kv_cache,
-                ori_block_table=swa_metadata.req_metadata.block_table,
-                cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                metadata=compressor_attn_metadata.req_metadata.sas_metadata,
-                cmp_mask_mode=3,
-                **common_attn_kwargs,
-            )[0]
+            if peak_active
+            else nullcontext()
+        )
+        with attn_core_context:
+            if self.compress_ratio <= 1:
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    ori_block_table=swa_metadata.req_metadata.block_table,
+                    metadata=swa_metadata.req_metadata.sas_metadata,
+                    **common_attn_kwargs,
+                )[0]
+            elif self.compress_ratio == 4:
+                assert compressor_attn_metadata.req_metadata is not None
+                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                    common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
+                )
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    cmp_sparse_indices=compress_topk_idxs,
+                    ori_block_table=swa_metadata.req_metadata.block_table,
+                    cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
+                    metadata=req_metadata.sas_metadata,
+                    cmp_mask_mode=3,
+                    **common_attn_kwargs,
+                )[0]
+            else:
+                assert compressor_attn_metadata.req_metadata is not None
+                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                    common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
+                )
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    ori_block_table=swa_metadata.req_metadata.block_table,
+                    cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
+                    metadata=compressor_attn_metadata.req_metadata.sas_metadata,
+                    cmp_mask_mode=3,
+                    **common_attn_kwargs,
+                )[0]
         return attn_output, o_proj_full_handles
 
     def _restore_tp_head_layout(

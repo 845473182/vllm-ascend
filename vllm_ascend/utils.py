@@ -1572,7 +1572,11 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
 @lru_cache(maxsize=1)
 def enable_attn_chunk() -> bool:
     """
-    attn chunk（indexer query 维分块）总开关。
+    attn chunk（sparse_attn query 维分块）总开关。
+
+    控制下游 npu_sparse_attn_sharedkv 核心按 query 维分块串行执行，
+    以降低该算子 output buffer 的瞬时峰值（仅对 prefill 长序列有效；
+    workspace 为常量，不受影响）。
     独立于 enable_dsa_cp：它是一个纯粹的「前向内分块」开关，
     与控制 o_proj 全量权重路径的 enable_dsa_cp 无逻辑绑定。
     默认 False（保持原单次调用行为），需显式在 additional_config 中开启。
@@ -1588,7 +1592,11 @@ def enable_attn_chunk() -> bool:
 
 @lru_cache(maxsize=1)
 def get_attn_chunk_size() -> int:
-    """attn chunk 的分块大小（token 数）。<=0 表示关闭分块。"""
+    """sparse_attn query 维分块大小（token 数）。<=0 表示关闭分块。
+
+    每次减半收益递减（workspace 为常量地板）；过小则增加 launch 次数
+    与串行步数，需在峰值与吞吐间权衡。默认 1024。
+    """
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
@@ -1600,9 +1608,9 @@ def get_attn_chunk_size() -> int:
 
 @lru_cache(maxsize=1)
 def enable_attn_chunk_verify() -> bool:
-    """一次性质检开关：分块结果与单次调用逐元素比对，不一致即报错。
+    """一次性质检开关：sparse_attn 分块结果与单次调用逐元素比对，不一致即报错。
 
-    仅用于真机首次验证（会额外跑一次全量 indexer 调用，有性能开销）。
+    仅用于真机首次验证（会额外跑一次全量 sparse_attn 调用，有性能开销）。
     验证通过后应在 additional_config 中关闭。
     """
     from vllm.config import get_current_vllm_config

@@ -73,6 +73,18 @@ def _attn_peak_phase(layer_name: str) -> str:
     return "mtp" if layer_name.startswith("mtp.") else "target"
 
 
+def _attn_peak_layer_idx(layer_name: str):
+    """Layer index parsed from the layer name, or None if unavailable.
+
+    `model.layers.<idx>.self_attn` -> <idx>, `mtp.<idx>.self_attn` -> <idx>.
+    """
+    parts = layer_name.split(".")
+    try:
+        return int(parts[parts.index("layers") + 1]) if "layers" in parts else int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
 @dataclass
 class DSACPMetadata:
     """Context-parallel metadata for sequence-sharded DSA execution."""
@@ -1253,6 +1265,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             record_activation_peak(
                 f"{phase}_attn_o_proj",
                 f"{phase}.layer.{layer_name}.o_proj",
+                layer_idx=_attn_peak_layer_idx(layer_name),
                 num_tokens=num_tokens,
             )
             if self.activation_peak_debug and is_activation_peak_profiling()
@@ -1348,6 +1361,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             record_activation_peak(
                 f"{phase}_attn_q_proj",
                 f"{phase}.layer.{layer_name}.q_proj",
+                layer_idx=_attn_peak_layer_idx(layer_name),
                 num_tokens=hidden_states_local.shape[0],
             )
             if peak_active
@@ -1418,6 +1432,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             record_activation_peak(
                 f"{phase}_attn_kv_proj",
                 f"{phase}.layer.{layer_name}.kv_proj",
+                layer_idx=_attn_peak_layer_idx(layer_name),
                 num_tokens=hidden_states_cache.shape[0],
             )
             if peak_active
@@ -1446,6 +1461,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     record_activation_peak(
                         f"{phase}_attn_indexer_update",
                         f"{phase}.layer.{layer_name}.indexer_update",
+                        layer_idx=_attn_peak_layer_idx(layer_name),
                         num_tokens=hidden_states_cache.shape[0],
                     )
                     if peak_active
@@ -1459,7 +1475,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
                         actual_seq_lengths_query=actual_seq_lengths_query,
                     )
                 def _indexer_single_call():
-                    # 原始单次调用路径（关闭分块 / 小输入 / 质检基准）
+                    # indexer 单次全量调用（indexer 侧不再分块，query 维 chunking
+                    # 统一由下游 sparse_attn 承担）。
                     return self._indexer_select_topk(
                         x=hidden_states_local,
                         qr=qr_local,
@@ -1472,118 +1489,27 @@ class AscendDSACPImpl(DSAAttentionImpl):
                         qr_pertoken_scale=qr_pertoken_scale_local,
                     )
 
-                if has_prefill:
-                    seq_len = hidden_states_local.size(0)
-                    chunk_size = self.attn_chunk_size
-                    # 三条启用条件：开关打开 且 chunk_size 有效 且 输入确实超过一个分块
-                    use_chunk = (
-                        self.enable_attn_chunk
-                        and chunk_size is not None
-                        and chunk_size > 0
-                        and seq_len > chunk_size
+                seq_len = hidden_states_local.size(0)
+                indexer_topk_context = (
+                    record_activation_peak(
+                        f"{phase}_attn_indexer_topk",
+                        f"{phase}.layer.{layer_name}.indexer_topk",
+                        layer_idx=_attn_peak_layer_idx(layer_name),
+                        num_tokens=seq_len,
                     )
-                    if self.enable_attn_chunk and self._attn_chunk_log_count < 10:
-                        self._attn_chunk_log_count += 1
-                        if use_chunk:
-                            num_chunks = (seq_len + chunk_size - 1) // chunk_size
-                            logger.warning(
-                                "[ATTN_CHUNK] rank=%s seq_len=%s split into %s chunk(s) "
-                                "(chunk_size=%s, layer=%s)",
-                                self.tp_rank,
-                                seq_len,
-                                num_chunks,
-                                chunk_size,
-                                layer_name,
-                            )
-                        else:
-                            logger.warning(
-                                "[ATTN_CHUNK] rank=%s skip chunking: seq_len=%s <= chunk_size=%s, "
-                                "single indexer call (layer=%s)",
-                                self.tp_rank,
-                                seq_len,
-                                chunk_size,
-                                layer_name,
-                            )
-
-                    indexer_topk_context = (
-                        record_activation_peak(
-                            f"{phase}_attn_indexer_topk",
-                            f"{phase}.layer.{layer_name}.indexer_topk",
-                            num_tokens=seq_len,
-                        )
-                        if peak_active
-                        else nullcontext()
-                    )
-                    with indexer_topk_context:
-                        if not use_chunk:
-                            compress_topk_idxs = _indexer_single_call()
-                        else:
-                            # local_seq_lengths_query == cp_metadata.local_query_start_loc：
-                            # 打包 local query 的【累积起始数组】[n_seq+1]，
-                            # starts[0]==0，starts[-1]==seq_len。
-                            starts = local_seq_lengths_query
-                            seq_begins = starts[:-1]
-                            seq_ends = starts[1:]
-
-                            def _indexer_chunk_call(cs: int, ce: int, q_start_loc: torch.Tensor):
-                                return self._indexer_select_topk(
-                                    x=hidden_states_local[cs:ce, :],
-                                    qr=qr_local[cs:ce, :],
-                                    kv_cache=kv_cache,
-                                    attn_metadata=attn_metadata,
-                                    cos=local_cos[cs:ce, :, :, :],
-                                    sin=local_sin[cs:ce, :, :, :],
-                                    actual_seq_lengths_query=q_start_loc,
-                                    # key 侧不变：chunk 仍读取全部 local 序列的 indexer KV，
-                                    # 与 block_table 行保持对齐（窗口外序列 query 长度为 0）。
-                                    actual_seq_lengths_key=local_seq_lengths_key,
-                                    qr_pertoken_scale=(
-                                        qr_pertoken_scale_local[cs:ce]
-                                        if qr_pertoken_scale_local is not None
-                                        else None
-                                    ),
-                                )
-
-                            # 预分配完整输出，chunk 结果直接写入对应区间：
-                            # 避免 list 持有全部 chunk 输出 + torch.cat 再拷一份
-                            # 导致的 ~2x 瞬时峰值（32k 输入下会 OOM）。
-                            compress_topk_idxs = None
-                            for cs in range(0, seq_len, chunk_size):
-                                ce = min(cs + chunk_size, seq_len)
-                                # 序列区间 [seq_begins[i], seq_ends[i]) 与窗口 [cs, ce) 的交叠长度
-                                # （device 上计算，无 host 同步；不相交为 0）
-                                overlap = (seq_ends.clamp(max=ce) - seq_begins.clamp(min=cs)).clamp_(min=0)
-                                # 重建本 chunk 的累积起始数组（长度 n_seq+1，首元素 0）。
-                                # cumsum 会把结果提升为 int64，而 lightning indexer 的 tiling
-                                # 只接受 int32，这里显式转回 int32。
-                                chunk_start_loc = torch.cat(
-                                    [overlap.new_zeros(1), torch.cumsum(overlap, dim=0)]
-                                ).to(torch.int32)
-                                chunk_out = _indexer_chunk_call(cs, ce, chunk_start_loc)
-                                if compress_topk_idxs is None:
-                                    # 用第一个 chunk 的输出推导完整形状
-                                    full_shape = (seq_len,) + tuple(chunk_out.shape[1:])
-                                    compress_topk_idxs = torch.empty(
-                                        full_shape, dtype=chunk_out.dtype, device=chunk_out.device
-                                    )
-                                compress_topk_idxs[cs:ce] = chunk_out
-
-                            # 一次性质检：分块结果必须与单次调用逐元素一致
-                            if self.verify_attn_chunk:
-                                ref = _indexer_single_call()
-                                if not torch.equal(compress_topk_idxs, ref):
-                                    raise RuntimeError(
-                                        "attn chunk mismatch vs single call: check kernel support "
-                                        "for zero-length query seqs / position-sensitive masking "
-                                        "(see A2/A3 in this file header)"
-                                    )
-                else:
+                    if peak_active
+                    else nullcontext()
+                )
+                # indexer 侧不再分块：query 维 chunking 已统一收敛到下游 sparse_attn。
+                # 始终单次调用，输出形状 = [seq_len, ...]。
+                with indexer_topk_context:
                     compress_topk_idxs = _indexer_single_call()
 
             compressor_context = (
                 record_activation_peak(
                     f"{phase}_attn_compressor",
                     f"{phase}.layer.{layer_name}.compressor",
+                    layer_idx=_attn_peak_layer_idx(layer_name),
                     num_tokens=hidden_states_cache.shape[0],
                 )
                 if peak_active
@@ -1620,75 +1546,280 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
+        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:
             DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                 extra_attn_kwargs, cu_seqlens_ori_kv=local_seq_lengths_query
             )
 
-        common_attn_kwargs = dict(
-            cu_seqlens_q=local_seq_lengths_query,
-            seqused_kv=local_seq_lengths_key,
-            sinks=self.attn_sink,
-            softmax_scale=self.softmax_scale,
-            cmp_ratio=max(self.compress_ratio, 1),
-            ori_mask_mode=4,
-            ori_win_left=self.window_size - 1,
-            ori_win_right=0,
-            layout_q="TND",
-            layout_kv="PA_ND",
-            **extra_attn_kwargs,
+        # 按 compress_ratio 选定本层的固定算子入参（不含 q / cu_seqlens_q /
+        # cmp_sparse_indices / metadata / seqused_kv——这几项在 query 分块时按 chunk
+        # 重建/切片）。cu_seqlens_q 也不放进 common_attn_kwargs：query 分块时每 chunk
+        # 重建。seqused_kv 同理：单次路径用全量，分块路径用 per-chunk 缩放后的值。
+        ori_block_table = swa_metadata.req_metadata.block_table
+        cmp_block_table = (
+            compressor_attn_metadata.req_metadata.block_table
+            if (self.compress_ratio > 1 and compressor_attn_metadata.req_metadata is not None)
+            else None
         )
+        if self.compress_ratio <= 1:
+            sas_metadata_full = swa_metadata.req_metadata.sas_metadata
+            sparse_indices = None
+            cmp_kv = None
+            cmp_mask_mode = None
+        elif self.compress_ratio == 4:
+            assert compressor_attn_metadata.req_metadata is not None
+            assert compress_topk_idxs is not None
+            sas_metadata_full = req_metadata.sas_metadata
+            sparse_indices = compress_topk_idxs
+            cmp_kv = compress_kv_cache
+            cmp_mask_mode = 3
+        else:
+            assert compressor_attn_metadata.req_metadata is not None
+            sas_metadata_full = compressor_attn_metadata.req_metadata.sas_metadata
+            sparse_indices = None
+            cmp_kv = compress_kv_cache
+            cmp_mask_mode = 3
+        cmp_extra = dict(cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list) \
+            if self.compress_ratio > 1 else {}
+
+        def _build_common_attn_kwargs(cu_seqlens_q_in, seqused_kv_in):
+            kw = dict(
+                cu_seqlens_q=cu_seqlens_q_in,
+                seqused_kv=seqused_kv_in,
+                sinks=self.attn_sink,
+                softmax_scale=self.softmax_scale,
+                cmp_ratio=max(self.compress_ratio, 1),
+                ori_mask_mode=4,
+                ori_win_left=self.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                **extra_attn_kwargs,
+            )
+            if cmp_extra:
+                kw.update(cmp_extra)
+            return kw
+
+        def _run_attn(q_in, cu_seqlens_q_in, seqused_kv_in, metadata_in, indices_in):
+            """单次（单 chunk 或全量）稀疏注意力调用。"""
+            kw = _build_common_attn_kwargs(cu_seqlens_q_in, seqused_kv_in)
+            if self.compress_ratio <= 1:
+                return attn_op(
+                    q_in, ori_kv=swa_kv_cache, ori_block_table=ori_block_table,
+                    metadata=metadata_in, **kw,
+                )[0]
+            return attn_op(
+                q_in, ori_kv=swa_kv_cache, cmp_kv=cmp_kv,
+                cmp_sparse_indices=indices_in,
+                ori_block_table=ori_block_table, cmp_block_table=cmp_block_table,
+                metadata=metadata_in, cmp_mask_mode=cmp_mask_mode, **kw,
+            )[0]
+
+        def _build_chunk_sas_metadata(chunk_cu_seqlens_q, chunk_seqused_kv,
+                                      chunk_max_q, chunk_max_kv):
+            """为单个 query chunk 重建 [1024] sas_metadata（自洽 tiling）。
+
+            与 AscendDSACPMetadataBuilder._build_sas_metadata 等价，但用 chunk 专用
+            的 cu_seqlens_q / seqused_kv / max_seqlen_*，保证内核 tiling 与切片后的
+            q 张量边界一致，避免按全量 offset 越界读 GM。
+            """
+            num_reqs = chunk_cu_seqlens_q.shape[0] - 1
+            mc = self.vllm_config.model_config
+            kw = dict(
+                num_heads_q=self.num_heads,
+                num_heads_kv=1,
+                head_dim=self.head_dim,
+                cu_seqlens_q=chunk_cu_seqlens_q,
+                cu_seqlens_ori_kv=chunk_cu_seqlens_q,   # prefill: ori_kv len == q len
+                cu_seqlens_cmp_kv=cmp_extra.get("cu_seqlens_cmp_kv"),
+                seqused_q=torch.tensor([], device=q.device, dtype=torch.int32),
+                seqused_kv=chunk_seqused_kv,
+                max_seqlen_q=chunk_max_q,
+                max_seqlen_kv=chunk_max_kv,
+                batch_size=num_reqs,
+                ori_mask_mode=4,
+                ori_win_left=self.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                has_ori_kv=True,
+                device=str(q.device),
+            )
+            cmp_ratio = self.compress_ratio if self.compress_ratio > 1 else 1
+            if self.compress_ratio > 1:
+                kw["has_cmp_kv"] = True
+                kw["cmp_mask_mode"] = 3
+                kw["cmp_ratio"] = cmp_ratio
+                if self.compress_ratio == 4:
+                    kw["cmp_topk"] = mc.hf_config.index_topk
+            else:
+                kw["cmp_ratio"] = cmp_ratio
+                kw["has_cmp_kv"] = False
+            return metadata_op(**kw)
 
         attn_core_context = (
             record_activation_peak(
                 f"{phase}_attn_core",
                 f"{phase}.layer.{layer_name}.sparse_attn",
+                layer_idx=_attn_peak_layer_idx(layer_name),
                 num_tokens=q.shape[0],
             )
             if peak_active
             else nullcontext()
         )
         with attn_core_context:
-            if self.compress_ratio <= 1:
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    ori_block_table=swa_metadata.req_metadata.block_table,
-                    metadata=swa_metadata.req_metadata.sas_metadata,
-                    **common_attn_kwargs,
-                )[0]
-            elif self.compress_ratio == 4:
-                assert compressor_attn_metadata.req_metadata is not None
-                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
-                    common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
+            # ============ sparse_attn 核心 query 维分块 ============
+            # 算子约束：窗口位置按 actS2-actS1+s1Idx 相对推导（无绝对位置入参），
+            # 且 sas_metadata 是预构建 tiling，编码了全量 cu_seqlens_q/max_seqlen_q。
+            # 直接传切片 q + 全量 metadata 会越界读 GM（aicore 异常）。
+            # 正确做法：每个 chunk 重建自洽 metadata，并把 seqused_kv 缩到
+            # 「截至本 chunk 末端」的因果可见长度——使 actS2-actS1+s1Idx 仍等于该
+            # query 在原序列中的真实相对位置，与单次调用逐 token 等价。
+            seq_len = q.shape[0]
+            use_attn_chunk = (
+                self.enable_attn_chunk
+                and self.attn_chunk_size is not None
+                and self.attn_chunk_size > 0
+                and has_prefill
+                and seq_len > self.attn_chunk_size
+            )
+            if self.enable_attn_chunk and self._attn_chunk_log_count < 10:
+                self._attn_chunk_log_count += 1
+                if use_attn_chunk:
+                    num_chunks = (seq_len + self.attn_chunk_size - 1) // self.attn_chunk_size
+                    logger.warning(
+                        "[ATTN_CHUNK] rank=%s sparse_attn seq_len=%s split into %s chunk(s) "
+                        "(chunk_size=%s, layer=%s)",
+                        self.tp_rank, seq_len, num_chunks, self.attn_chunk_size, layer_name,
+                    )
+                else:
+                    logger.warning(
+                        "[ATTN_CHUNK] rank=%s sparse_attn skip chunking: seq_len=%s <= chunk_size=%s, "
+                        "single attn call (layer=%s)",
+                        self.tp_rank, seq_len, self.attn_chunk_size, layer_name,
+                    )
+
+            if not use_attn_chunk:
+                # 原始单次调用路径（decode / 小输入 / 关闭分块）
+                indices = sparse_indices if self.compress_ratio == 4 else None
+                attn_output = _run_attn(
+                    q, local_seq_lengths_query, local_seq_lengths_key,
+                    sas_metadata_full, indices,
                 )
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    cmp_sparse_indices=compress_topk_idxs,
-                    ori_block_table=swa_metadata.req_metadata.block_table,
-                    cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                    metadata=req_metadata.sas_metadata,
-                    cmp_mask_mode=3,
-                    **common_attn_kwargs,
-                )[0]
             else:
-                assert compressor_attn_metadata.req_metadata is not None
-                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
-                    common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
-                )
-                attn_output = attn_op(
-                    q,
-                    ori_kv=swa_kv_cache,
-                    cmp_kv=compress_kv_cache,
-                    ori_block_table=swa_metadata.req_metadata.block_table,
-                    cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                    metadata=compressor_attn_metadata.req_metadata.sas_metadata,
-                    cmp_mask_mode=3,
-                    **common_attn_kwargs,
-                )[0]
+                # local_seq_lengths_query == cp_metadata.local_query_start_loc：
+                # 打包 local query 的累积起始数组 [num_reqs+1]，starts[0]==0。
+                # 注意底层数组长度为 max_num_seqs+1（预分配），索引 >= num_reqs+1 处为
+                # 残留的 0（seq_end < seq_begin 的非法空序列）。必须截到 [:num_reqs+1]，
+                # 否则 per-chunk 重建的 cu_seqlens_q / seqused_kv 会带上这些空序列，
+                # 使 metadata batch_size = max_num_seqs 而非 num_reqs，与全量基准的
+                # sas_metadata（batch_size=num_reqs）不一致——内核按 bIdx 遍历序列时
+                # 边界/tiling 不同，尾部 chunk（多序列跨边界）会出现数值不一致。
+                num_reqs = req_metadata.num_reqs_actual
+                starts = local_seq_lengths_query[:num_reqs + 1]
+                kv_lens = local_seq_lengths_key[:num_reqs]
+                seq_begins = starts[:-1]
+                seq_ends = starts[1:]
+                chunk_size = self.attn_chunk_size
+
+                verify = self.verify_attn_chunk
+                # verify 模式：先跑全量单次调用作为基准 ref_full，逐 chunk 比对对应
+                # 切片。因为比对通过即说明分块==全量，直接返回 ref_full 作为输出，
+                # 无需再预分配一份 attn_output——避免两份完整输出同时存活导致 ~2x
+                # 峰值（长序列 + profiling 下会 OOM）。
+                # 非 verify 模式：复用 q 自身作为输出 buffer——q 在 attn 后不再使用，
+                # 形状/ dtype 与 attn_output 完全一致。每 chunk 的 chunk_out 写入
+                # q[cs:ce]（顺序写，已处理 chunk 的 q 切片不再被读，无 RAW 冲突），
+                # 省掉一份全量 [seq_len,H,D] 预分配。attn_core 峰值从 baseline+全量
+                # output 降到 baseline+chunk_out，这才是分块降峰的真实收益来源。
+                if verify:
+                    indices_full = sparse_indices if self.compress_ratio == 4 else None
+                    attn_output = _run_attn(
+                        q, local_seq_lengths_query, local_seq_lengths_key,
+                        sas_metadata_full, indices_full,
+                    )
+                else:
+                    attn_output = q  # 原地复用：最终返回 q 作为 attn_output
+                for cs in range(0, seq_len, chunk_size):
+                    ce = min(cs + chunk_size, seq_len)
+
+                    # 本 chunk 内每序列的 query 数（与 [cs,ce) 的交叠长度）
+                    overlap = (seq_ends.clamp(max=ce) - seq_begins.clamp(min=cs)).clamp_(min=0)
+                    chunk_cu_seqlens_q = torch.cat(
+                        [overlap.new_zeros(1), torch.cumsum(overlap, dim=0)]
+                    ).to(torch.int32)
+
+                    # 截至本 chunk 末端、每序列因果可见的 KV 长度（含 start_pos 偏移）。
+                    # actS2_chunk_i = local_seq_lens_i - max(0, seq_end_i - ce)：
+                    # 全量 KV 减去「属于本 chunk 之后 query 的尾部 KV」。这使内核
+                    # actS2-actS1+s1Idx == 该 query 的真实绝对 KV 位置（含 CP 跨 rank
+                    # 的 start_pos = local_seq_lens - local_query_lens 偏移），与单次
+                    # 调用逐 token 等价。全量 chunk 时退化为 local_seq_lens_i。
+                    tail_beyond = (seq_ends - ce).clamp_(min=0)
+                    chunk_seqused_kv = (kv_lens - tail_beyond).clamp_(min=0).to(torch.int32)
+
+                    # per-query 的 cmp_sparse_indices 直接切片，无需重映射（topk 索引
+                    # 按 query 全局位置排列，切片后局部位置天然对齐）。
+                    indices_chunk = (
+                        sparse_indices[cs:ce, :] if self.compress_ratio == 4 else None
+                    )
+
+                    # 重建本 chunk 自洽的 sas_metadata（不能用全量 sas_metadata_full）。
+                    chunk_max_q = max(1, int(overlap.max().item())) if overlap.numel() else 1
+                    chunk_max_kv = max(1, int(chunk_seqused_kv.max().item())) \
+                        if chunk_seqused_kv.numel() else 1
+                    chunk_sas_metadata = _build_chunk_sas_metadata(
+                        chunk_cu_seqlens_q, chunk_seqused_kv, chunk_max_q, chunk_max_kv,
+                    )
+
+                    chunk_out = _run_attn(
+                        q[cs:ce, :, :], chunk_cu_seqlens_q, chunk_seqused_kv,
+                        chunk_sas_metadata, indices_chunk,
+                    )
+
+                    if verify:
+                        # 逐 chunk 比对全量基准的对应切片（比完 chunk_out 即释放，
+                        # 不持有第二份完整输出）。
+                        # 注意：q 张量可能含 CP 对齐 padding 行（seq_len > 真实 query
+                        # 总数，cu_seqlens_q[-1] < seq_len）。ref 与 chunk 在 padding
+                        # 行写的都是 at::empty 未初始化垃圾，torch.equal 会因垃圾不同而
+                        # 误报 mismatch。只比对真实 token 行：本 chunk 真实 query 数 =
+                        # chunk_cu_seqlens_q[-1] = overlap.sum()，对应 ref 的
+                        # [cs, cs+real_count)（ref 按全量 cu_seqlens_q 紧致打包，真实
+                        # token 位置与 chunk 切片逐行对齐）。
+                        real_count = int(chunk_cu_seqlens_q[-1].item())
+                        if real_count > 0 and not torch.equal(
+                            chunk_out[:real_count], attn_output[cs:cs + real_count]
+                        ):
+                            # 诊断：打印本 chunk 的 per-seq 拆解，定位 seqused_kv /
+                            # cu_seqlens_q / indices 切片哪一项与全量不等价
+                            ref_slice = attn_output[cs:cs + real_count]
+                            diff = (chunk_out[:real_count].to(torch.float32) -
+                                    ref_slice.to(torch.float32)).abs()
+                            max_diff = float(diff.max().item())
+                            arg = int(diff.view(-1).argmax().item())
+                            per_seq = []
+                            for si in range(seq_begins.numel()):
+                                ov = int(overlap[si].item())
+                                sb = int(seq_begins[si].item())
+                                se_ = int(seq_ends[si].item())
+                                ckv = int(chunk_seqused_kv[si].item())
+                                lk = int(kv_lens[si].item())
+                                per_seq.append(
+                                    f"seq{si}: beg={sb} end={se_} kv_full={lk} "
+                                    f"overlap={ov} chunk_kv={ckv}"
+                                )
+                            raise RuntimeError(
+                                f"attn query-chunk mismatch at [{cs}:{ce}] (layer={layer_name}, "
+                                f"seq_len={seq_len}, real_tokens={real_count}, num_reqs={num_reqs}, "
+                                f"cmp_ratio={self.compress_ratio}): max_abs_diff={max_diff} at "
+                                f"flat={arg}\n" + "\n".join(per_seq)
+                            )
+                    else:
+                        # 原地写回 q：该 chunk 的 q 切片已被算子消费完，覆写无 RAW 冲突
+                        attn_output[cs:ce] = chunk_out
         return attn_output, o_proj_full_handles
 
     def _restore_tp_head_layout(

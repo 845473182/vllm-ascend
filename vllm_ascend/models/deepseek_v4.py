@@ -1047,21 +1047,65 @@ class DeepseekV2DecoderLayer(nn.Module):
             attention_peak_context = nullcontext()
 
         with attention_peak_context:
-            residual = hidden_states.clone()
-            hidden_states, post, comb = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+            residual_clone_context = (
+                record_activation_peak(
+                    f"{phase}_attn_residual_clone",
+                    f"{phase}.layer.{self.layer_idx}.residual_clone",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active
+                else nullcontext()
             )
-            hidden_states = self.input_layernorm(hidden_states)
+            with residual_clone_context:
+                residual = hidden_states.clone()
+            hc_pre_context = (
+                record_activation_peak(
+                    f"{phase}_attn_hc_pre",
+                    f"{phase}.layer.{self.layer_idx}.hc_pre",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active
+                else nullcontext()
+            )
+            with hc_pre_context:
+                hidden_states, post, comb = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                )
+            input_norm_context = (
+                record_activation_peak(
+                    f"{phase}_attn_input_norm",
+                    f"{phase}.layer.{self.layer_idx}.input_norm",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active
+                else nullcontext()
+            )
+            with input_norm_context:
+                hidden_states = self.input_layernorm(hidden_states)
             attn_kwargs = {
                 "positions": positions,
                 "hidden_states": hidden_states,
                 "llama_4_scaling": llama_4_scaling,
             }
             hidden_states = self.self_attn(**attn_kwargs)
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            hc_post_context = (
+                record_activation_peak(
+                    f"{phase}_attn_hc_post",
+                    f"{phase}.layer.{self.layer_idx}.hc_post",
+                    layer_idx=self.layer_idx,
+                    num_tokens=num_tokens,
+                )
+                if activation_peak_active
+                else nullcontext()
+            )
+            with hc_post_context:
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         moe_peak_context = (
             record_activation_peak(

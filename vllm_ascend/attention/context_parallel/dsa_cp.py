@@ -1011,6 +1011,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self.verify_attn_chunk = enable_attn_chunk_verify()
         # 每个 forward 会经过多层 indexer，用于日志限流，避免刷屏。
         self._attn_chunk_log_count = 0
+        # workspace 探针：跨层只测一次（synchronize 有开销，测一次拿到常量值即可）。
+        self._ws_probed = False
         # 激活峰值细分埋点开关（与 deepseek_v4.py 中的层级埋点共用同一配置）。
         self.activation_peak_debug = bool(getattr(get_ascend_config(), "activation_peak_debug", False))
         if self.enable_attn_chunk:
@@ -1774,10 +1776,43 @@ class AscendDSACPImpl(DSAAttentionImpl):
                         chunk_cu_seqlens_q, chunk_seqused_kv, chunk_max_q, chunk_max_kv,
                     )
 
-                    chunk_out = _run_attn(
-                        q[cs:ce, :, :], chunk_cu_seqlens_q, chunk_seqused_kv,
-                        chunk_sas_metadata, indices_chunk,
+                    # 估算算子 workspace 显存（仅在 profiling 开启时，首个 chunk 测一次）。
+                    # workspace 在 C++ tiling 层计算（sInnerSize_=512 硬编码，与 chunk_size
+                    # 无关），未暴露到 Python。用间接法：单次算子调用的峰值增量 -
+                    # chunk_out 字节数 ≈ workspace（+ 少量内部临时量，workspace 主导）。
+                    # synchronize 只在此诊断路径引入，生产路径无开销。
+                    ws_probe = (
+                        peak_active and cs == 0
+                        and not getattr(self, "_ws_probed", False)
                     )
+                    if ws_probe:
+                        torch.npu.reset_peak_memory_stats()
+                        ws_baseline = int(torch.npu.memory_allocated())
+                        chunk_out = _run_attn(
+                            q[cs:ce, :, :], chunk_cu_seqlens_q, chunk_seqused_kv,
+                            chunk_sas_metadata, indices_chunk,
+                        )
+                        torch.npu.synchronize()
+                        ws_peak = int(torch.npu.max_memory_allocated())
+                        ws_growth = ws_peak - ws_baseline
+                        chunk_out_bytes = chunk_out.numel() * chunk_out.element_size()
+                        workspace_est = max(0, ws_growth - chunk_out_bytes)
+                        self._ws_probed = True
+                        logger.warning(
+                            "[ATTN_CHUNK][WORKSPACE] rank=%s layer=%s chunk[%s:%s] "
+                            "op_peak_growth=%.3f MiB - chunk_out=%.3f MiB "
+                            "=> workspace_est=%.3f MiB (chunk_size=%s, q_shape=%s)",
+                            self.tp_rank, layer_name, cs, ce,
+                            ws_growth / (1024 * 1024),
+                            chunk_out_bytes / (1024 * 1024),
+                            workspace_est / (1024 * 1024),
+                            chunk_size, tuple(q.shape),
+                        )
+                    else:
+                        chunk_out = _run_attn(
+                            q[cs:ce, :, :], chunk_cu_seqlens_q, chunk_seqused_kv,
+                            chunk_sas_metadata, indices_chunk,
+                        )
 
                     if verify:
                         # 逐 chunk 比对全量基准的对应切片（比完 chunk_out 即释放，
@@ -1820,6 +1855,10 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     else:
                         # 原地写回 q：该 chunk 的 q 切片已被算子消费完，覆写无 RAW 冲突
                         attn_output[cs:ce] = chunk_out
+                    # 立刻释放本 chunk 的临时输出，避免下一轮 _run_attn 分配新
+                    # chunk_out 时与上一轮残留共存导致 2×chunk_out 峰值
+                    # （core peak 从 2×chunk_out+overhead 降到 1×chunk_out+overhead）。
+                    del chunk_out
         return attn_output, o_proj_full_handles
 
     def _restore_tp_head_layout(

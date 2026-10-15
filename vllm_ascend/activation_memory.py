@@ -221,11 +221,16 @@ class ActivationPeakProfiler:
         # `*_attn_*` records are its components and must not be selected here,
         # otherwise the peak line points at a component and the component
         # breakdown lists the whole scope as one of its own parts.
+        # Select by absolute peak_bytes (not growth) so the attention breakdown
+        # reflects the layer where the all-time peak actually occurred, matching
+        # the total_peak line. Selecting by growth would pick the layer with the
+        # largest *increment* (often layer 0, whose low baseline inflates growth)
+        # and misattribute the peak to a different layer than total_peak.
         whole_attention_records = [
             record for record in attention_records if record.category.endswith("_attention")
         ]
         attn_peak = max(
-            whole_attention_records, key=lambda item: item.peak_growth_bytes, default=None
+            whole_attention_records, key=lambda item: item.peak_bytes, default=None
         )
         overall_peak_record = max(self.records, key=lambda item: item.peak_bytes, default=None)
 
@@ -335,7 +340,9 @@ class ActivationPeakProfiler:
             for record in self.records
             if record.category.endswith("_moe") or "moe" in record.category or "ffn" in record.category
         ]
-        moe_peak = max(moe_records, key=lambda item: item.peak_growth_bytes, default=None)
+        # Select by absolute peak_bytes to match total_peak attribution (see
+        # attn_peak selection rationale above).
+        moe_peak = max(moe_records, key=lambda item: item.peak_bytes, default=None)
         if moe_peak is not None:
             logger.warning(
                 "[ACTIVATION_PEAK][REQUEST_SUMMARY] rank=%s moe_peak=%.3f GiB "
